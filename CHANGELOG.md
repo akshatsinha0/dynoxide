@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-04-30
+
+### Added
+
+- A `StorageBackend` trait in the new `dynoxide::storage_backend` module, decoupling the data layer from a specific SQLite binding. The native rusqlite-backed `Storage` implements the trait. Today the trait is consumed monomorphically only -- `Database`, action handlers, and `DynoxideError` continue to operate against `Storage` directly.
+- A `BackendError` enum returned by the trait surface, with an explicit `rusqlite::Error -> BackendError` mapping for the common failure modes (`NotADatabase`, locked / busy, constraint violations, I/O failures).
+- A `Clock` capability on `Storage` so the trait surface does not assume `std::time`. Stream and TTL paths route their `created_at` and sweep timestamps through the clock; `SystemClock` is the default and `ManualClock` ships as a deterministic test helper. Other `std::time` call sites (idempotency cache, action-handler timestamps, snapshots) remain native-only and are unchanged.
+- A `wasm-stub` cargo feature that builds a placeholder `WaSqliteBackend` whose method bodies are `unimplemented!()`. The stub exists to catch trait-shape drift at type-check time before a real wa-sqlite backend has to absorb it. CI gains a `wasm-stub-check` job that runs `cargo check --features wasm-stub --lib` on every PR.
+
+### Notes
+
+- This release is behaviour-preserving: existing public APIs (`Database`, `Storage`, action handlers, error types) are unchanged. Tests, conformance suites, and benchmarks continue to pass against the same surface as 0.9.10.
+- Building dynoxide for `wasm32-unknown-unknown` is not yet supported. The trait surface is in place; making the rest of the codebase target-agnostic is the next pass and lands when a working WASM backend does.
+
 ## [0.9.10] - 2026-04-27
 
 ### Fixed

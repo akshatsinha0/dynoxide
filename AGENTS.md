@@ -100,11 +100,17 @@ helps a reviewer but are not required.
 
 ## Storage layer boundary
 
-The storage layer (`src/storage.rs` and related) is scheduled for a
-significant refactor before 1.0: the `Database` type will become
-generic over a `StorageBackend` trait. Please open an issue before
-submitting changes in this area; we can advise whether your change
-fits the current architecture, the planned one, or is best deferred.
+The storage layer is mid-refactor. A `StorageBackend` trait now lives in
+`src/storage_backend/` and the native rusqlite-backed `Storage` implements
+it; nothing dynamic dispatches the trait yet, and `Database` plus the
+action handlers continue to operate against `Storage` directly. Folding
+the `Storage::conn()` and `Storage::conn_mut()` escape hatches into the
+trait (or migrating their callers off them) is the next move and is
+sequenced with the upcoming non-native (browser / WASM) backend. Please
+open an issue before submitting changes to `src/storage.rs`,
+`src/storage_backend/`, or call sites that use `conn()` directly; we can
+advise whether your change fits the current shape or is better held until
+the next pass.
 
 ## Where to discuss
 

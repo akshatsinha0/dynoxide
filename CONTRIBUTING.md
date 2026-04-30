@@ -13,11 +13,15 @@ same ground in a form those tools pick up automatically.
 - Open a GitHub issue describing the change if it is more than a small
   bug fix or obvious cleanup. A short paragraph is enough. This catches
   direction questions before a PR round-trips.
-- The storage layer (`src/storage.rs` and related) is scheduled for a
-  significant refactor before 1.0: the `Database` type will become
-  generic over a `StorageBackend` trait. Please open an issue before
-  submitting changes in this area so we can advise whether your change
-  fits the current architecture, the planned one, or is best deferred.
+- The storage layer is mid-refactor. A `StorageBackend` trait now lives
+  in `src/storage_backend/` and the native rusqlite-backed `Storage`
+  implements it. Nothing dynamic dispatches the trait yet; `Database`
+  and the action handlers still operate against `Storage` directly. The
+  `Storage::conn()` and `Storage::conn_mut()` escape hatches are not on
+  the trait and folding them in is the next pass. Please open an issue
+  before submitting changes to `src/storage.rs`, `src/storage_backend/`,
+  or call sites that use `conn()` directly so we can advise whether your
+  change fits the current shape or is better held until the next pass.
 - If you want to add a new dependency, open an issue so we can weigh
   binary size, build time, and licence.
 
