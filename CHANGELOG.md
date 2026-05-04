@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.12] - 2026-05-04
+
+### Fixed
+
+- Unix: port releases immediately after `dynoxide serve` shuts down. The listener used to skip `SO_REUSEADDR`, leaving leftover `TIME_WAIT` sockets from connected clients to block restart for ~60s. Live-listener conflict detection is unaffected: `SO_REUSEADDR` only bypasses `TIME_WAIT`, not active sockets.
+
+  Windows: unchanged. `SO_REUSEADDR` lets another process hijack an active bind there, so we leave it off.
+
 ## [0.9.11] - 2026-05-04
 
 ### Fixed
