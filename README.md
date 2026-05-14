@@ -63,8 +63,7 @@ See [full results by tier](https://github.com/nubo-db/dynamodb-conformance#resul
 | Conformance (601 tests) | **100%** | 88.2% | 89.0% | 78.0% |
 | Language | Rust | Java | Python + Java | Node.js |
 | Storage | SQLite | SQLite | SQLite (via DDB Local) | LevelDB |
-| Docker required | — | ✓ | ✓ | — |
-| JVM required | — | ✓ | ✓ | — |
+| Runtime dependency | — | JVM | Docker + LocalStack | Node.js |
 | Embeddable (Rust / iOS) | ✓ | — | — | — |
 | MCP server for agents | ✓ | — | — | — |
 
