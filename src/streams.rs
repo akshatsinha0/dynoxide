@@ -3,10 +3,11 @@
 //! Generates stream records on write operations when streams are enabled on a table.
 
 use crate::errors::Result;
-use crate::storage::{Storage, TableMetadata};
+use crate::storage::TableMetadata;
+use crate::storage_backend::StorageBackend;
+use crate::storage_backend::clock::Clock;
 use crate::types::{AttributeValue, Item};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Region used in ARNs for the local emulator.
 pub const LOCAL_REGION: &str = "dynoxide";
@@ -34,11 +35,15 @@ pub fn shard_id(table_name: &str) -> String {
 }
 
 /// Generate a stream label from the current timestamp.
-pub fn generate_stream_label() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}.{:09}", now.as_secs(), now.subsec_nanos())
+///
+/// The label format preserves the historical `<secs>.<nanos>` shape. The
+/// caller supplies the clock so production callers route through
+/// `Storage::clock()` while tests can pin time via `ManualClock`.
+pub fn generate_stream_label(clock: &dyn Clock) -> String {
+    let now_f64 = clock.now_unix_secs_f64();
+    let secs = now_f64.trunc() as u64;
+    let nanos = ((now_f64 - secs as f64) * 1_000_000_000.0) as u32;
+    format!("{secs}.{nanos:09}")
 }
 
 /// Extract only key attributes from an item given the key schema JSON.
@@ -61,8 +66,8 @@ pub fn extract_keys(item: &Item, key_schema_json: &str) -> HashMap<String, Attri
 /// For MODIFY: both are Some.
 /// For REMOVE: old_item is Some, new_item is None.
 #[allow(clippy::too_many_arguments)]
-pub fn record_stream_event(
-    storage: &Storage,
+pub async fn record_stream_event<S: StorageBackend>(
+    storage: &S,
     meta: &TableMetadata,
     old_item: Option<&Item>,
     new_item: Option<&Item>,
@@ -102,23 +107,24 @@ pub fn record_stream_event(
         _ => None,
     };
 
-    let seq_num = storage.next_stream_sequence_number(&meta.table_name)?;
+    let seq_num = storage
+        .next_stream_sequence_number(&meta.table_name)
+        .await?;
     let sid = shard_id(&meta.table_name);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = storage.clock().now_unix_secs() as i64;
 
-    storage.insert_stream_record(
-        &meta.table_name,
-        event_name,
-        &keys_json,
-        new_image_json.as_deref(),
-        old_image_json.as_deref(),
-        &seq_num.to_string(),
-        &sid,
-        now,
-    )?;
+    storage
+        .insert_stream_record(
+            &meta.table_name,
+            event_name,
+            &keys_json,
+            new_image_json.as_deref(),
+            old_image_json.as_deref(),
+            &seq_num.to_string(),
+            &sid,
+            now,
+        )
+        .await?;
 
     Ok(())
 }

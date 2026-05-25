@@ -1,7 +1,7 @@
 use crate::actions::helpers;
 use crate::errors::{DynoxideError, Result};
 use crate::expressions;
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -178,7 +178,10 @@ pub struct QueryResponse {
     pub consumed_capacity: Option<crate::types::ConsumedCapacity>,
 }
 
-pub fn execute(storage: &Storage, mut request: QueryRequest) -> Result<QueryResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    mut request: QueryRequest,
+) -> Result<QueryResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
 
@@ -321,7 +324,7 @@ pub fn execute(storage: &Storage, mut request: QueryRequest) -> Result<QueryResp
         }
     }
 
-    let meta = helpers::require_table_for_item_op(storage, &request.table_name)?;
+    let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let table_key_schema = helpers::parse_key_schema(&meta)?;
 
     // Determine effective partition key name early so we can pass it to
@@ -702,12 +705,18 @@ pub fn execute(storage: &Storage, mut request: QueryRequest) -> Result<QueryResp
     };
     let rows = if let Some(ref index_name) = request.index_name {
         if is_lsi {
-            storage.query_lsi_items(&request.table_name, index_name, &pk_str, &query_params)?
+            storage
+                .query_lsi_items(&request.table_name, index_name, &pk_str, &query_params)
+                .await?
         } else {
-            storage.query_gsi_items(&request.table_name, index_name, &pk_str, &query_params)?
+            storage
+                .query_gsi_items(&request.table_name, index_name, &pk_str, &query_params)
+                .await?
         }
     } else {
-        storage.query_items(&request.table_name, &pk_str, &query_params)?
+        storage
+            .query_items(&request.table_name, &pk_str, &query_params)
+            .await?
     };
 
     // Parse filter expression if present
@@ -798,7 +807,10 @@ pub fn execute(storage: &Storage, mut request: QueryRequest) -> Result<QueryResp
                 .and_then(|sk_name| index_item.get(sk_name))
                 .and_then(|v| v.to_key_string())
                 .unwrap_or_default();
-            if let Some(full_json) = storage.get_item(&request.table_name, &base_pk, &base_sk)? {
+            if let Some(full_json) = storage
+                .get_item(&request.table_name, &base_pk, &base_sk)
+                .await?
+            {
                 let full_item: Item = serde_json::from_str(&full_json).map_err(|e| {
                     DynoxideError::InternalServerError(format!("Bad item JSON: {e}"))
                 })?;

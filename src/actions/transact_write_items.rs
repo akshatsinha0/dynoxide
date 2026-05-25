@@ -1,6 +1,6 @@
 use crate::actions::helpers;
 use crate::errors::{CancellationReason, DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{self, AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -108,8 +108,8 @@ pub struct TransactWriteItemsResponse {
     pub item_collection_metrics: Option<HashMap<String, Vec<crate::types::ItemCollectionMetrics>>>,
 }
 
-pub fn execute(
-    storage: &Storage,
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
     request: TransactWriteItemsRequest,
 ) -> Result<TransactWriteItemsResponse> {
     let items = &request.transact_items;
@@ -136,7 +136,7 @@ pub fn execute(
     // Validate: no duplicate item targets
     let mut seen_targets = HashSet::new();
     for item in items {
-        let target = get_item_target(storage, item)?;
+        let target = get_item_target(storage, item).await?;
         if !seen_targets.insert(target) {
             return Err(DynoxideError::ValidationException(
                 "Transaction request cannot include multiple operations on one item".to_string(),
@@ -152,60 +152,48 @@ pub fn execute(
         ));
     }
 
-    // Begin SQLite transaction
-    storage.begin_transaction()?;
+    // All actions run inside one SQLite transaction (all-or-nothing).
+    helpers::with_write_transaction(storage, execute_within_transaction(storage, items)).await?;
 
-    let result = execute_within_transaction(storage, items);
-
-    match result {
-        Ok(()) => {
-            storage.commit()?;
-            // Build consumed capacity per table
-            let consumed_capacity = if matches!(
-                request.return_consumed_capacity.as_deref(),
-                Some("TOTAL") | Some("INDEXES")
-            ) {
-                let mut table_sizes: HashMap<String, usize> = HashMap::new();
-                for item in items {
-                    let (table, size) = get_action_table_and_size(item);
-                    *table_sizes.entry(table).or_default() += size;
-                }
-                let caps: Vec<_> = table_sizes
-                    .iter()
-                    .filter_map(|(table, &size)| {
-                        crate::types::consumed_capacity(
-                            table,
-                            crate::types::write_capacity_units(size),
-                            &request.return_consumed_capacity,
-                        )
-                    })
-                    .collect();
-                Some(caps)
-            } else {
-                None
-            };
-            Ok(TransactWriteItemsResponse {
-                consumed_capacity,
-                item_collection_metrics: None,
+    // Build consumed capacity per table
+    let consumed_capacity = if matches!(
+        request.return_consumed_capacity.as_deref(),
+        Some("TOTAL") | Some("INDEXES")
+    ) {
+        let mut table_sizes: HashMap<String, usize> = HashMap::new();
+        for item in items {
+            let (table, size) = get_action_table_and_size(item);
+            *table_sizes.entry(table).or_default() += size;
+        }
+        let caps: Vec<_> = table_sizes
+            .iter()
+            .filter_map(|(table, &size)| {
+                crate::types::consumed_capacity(
+                    table,
+                    crate::types::write_capacity_units(size),
+                    &request.return_consumed_capacity,
+                )
             })
-        }
-        Err(e) => {
-            if let Err(rb_err) = storage.rollback() {
-                return Err(DynoxideError::InternalServerError(format!(
-                    "Transaction failed ({e}) and rollback also failed ({rb_err})"
-                )));
-            }
-            Err(e)
-        }
-    }
+            .collect();
+        Some(caps)
+    } else {
+        None
+    };
+    Ok(TransactWriteItemsResponse {
+        consumed_capacity,
+        item_collection_metrics: None,
+    })
 }
 
-fn execute_within_transaction(storage: &Storage, items: &[TransactWriteItem]) -> Result<()> {
+async fn execute_within_transaction<S: StorageBackend>(
+    storage: &S,
+    items: &[TransactWriteItem],
+) -> Result<()> {
     let mut cancellation_reasons: Vec<CancellationReason> = Vec::with_capacity(items.len());
     let mut has_failure = false;
 
     for item in items {
-        let reason = execute_single_action(storage, item);
+        let reason = execute_single_action(storage, item).await;
         match reason {
             Ok(()) => {
                 cancellation_reasons.push(CancellationReason {
@@ -251,15 +239,18 @@ fn execute_within_transaction(storage: &Storage, items: &[TransactWriteItem]) ->
     Ok(())
 }
 
-fn execute_single_action(storage: &Storage, item: &TransactWriteItem) -> Result<()> {
+async fn execute_single_action<S: StorageBackend>(
+    storage: &S,
+    item: &TransactWriteItem,
+) -> Result<()> {
     if let Some(ref put) = item.put {
-        execute_put(storage, put)
+        execute_put(storage, put).await
     } else if let Some(ref update) = item.update {
-        execute_update(storage, update)
+        execute_update(storage, update).await
     } else if let Some(ref delete) = item.delete {
-        execute_delete(storage, delete)
+        execute_delete(storage, delete).await
     } else if let Some(ref check) = item.condition_check {
-        execute_condition_check(storage, check)
+        execute_condition_check(storage, check).await
     } else {
         Err(DynoxideError::ValidationException(
             "TransactItem must contain exactly one of Put, Update, Delete, or ConditionCheck"
@@ -268,9 +259,9 @@ fn execute_single_action(storage: &Storage, item: &TransactWriteItem) -> Result<
     }
 }
 
-fn execute_put(storage: &Storage, put: &TransactPut) -> Result<()> {
+async fn execute_put<S: StorageBackend>(storage: &S, put: &TransactPut) -> Result<()> {
     crate::validation::validate_table_name(&put.table_name)?;
-    let meta = helpers::require_table_for_item_op(storage, &put.table_name)?;
+    let meta = helpers::require_table_for_item_op(storage, &put.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
 
     helpers::validate_item_keys(&put.item, &key_schema, &meta)?;
@@ -304,7 +295,7 @@ fn execute_put(storage: &Storage, put: &TransactPut) -> Result<()> {
 
     // Evaluate condition if present
     if let Some(ref cond_expr) = put.condition_expression {
-        let existing_json = storage.get_item(&put.table_name, &pk, &sk)?;
+        let existing_json = storage.get_item(&put.table_name, &pk, &sk).await?;
         let existing_item: Item = existing_json
             .as_ref()
             .and_then(|j| serde_json::from_str(j).ok())
@@ -329,8 +320,9 @@ fn execute_put(storage: &Storage, put: &TransactPut) -> Result<()> {
         .get(&key_schema.partition_key)
         .map(crate::storage::compute_hash_prefix)
         .unwrap_or_default();
-    let old_json =
-        storage.put_item_with_hash(&put.table_name, &pk, &sk, &item_json, size, &hash_prefix)?;
+    let old_json = storage
+        .put_item_with_hash(&put.table_name, &pk, &sk, &item_json, size, &hash_prefix)
+        .await?;
 
     let _ = super::gsi::maintain_gsis_after_write(
         storage,
@@ -341,7 +333,8 @@ fn execute_put(storage: &Storage, put: &TransactPut) -> Result<()> {
         &item,
         &key_schema.partition_key,
         key_schema.sort_key.as_deref(),
-    )?;
+    )
+    .await?;
 
     super::lsi::maintain_lsis_after_write(
         storage,
@@ -352,25 +345,26 @@ fn execute_put(storage: &Storage, put: &TransactPut) -> Result<()> {
         &item,
         &key_schema.partition_key,
         key_schema.sort_key.as_deref(),
-    )?;
+    )
+    .await?;
 
     // Record stream event
     let old_item: Option<Item> = old_json.and_then(|j| serde_json::from_str(&j).ok());
-    crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item))?;
+    crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
 
     Ok(())
 }
 
-fn execute_update(storage: &Storage, update: &TransactUpdate) -> Result<()> {
+async fn execute_update<S: StorageBackend>(storage: &S, update: &TransactUpdate) -> Result<()> {
     crate::validation::validate_table_name(&update.table_name)?;
-    let meta = helpers::require_table_for_item_op(storage, &update.table_name)?;
+    let meta = helpers::require_table_for_item_op(storage, &update.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
 
     helpers::validate_key_only(&update.key, &key_schema)?;
     // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&update.key, &key_schema)?;
 
-    let existing_json = storage.get_item(&update.table_name, &pk, &sk)?;
+    let existing_json = storage.get_item(&update.table_name, &pk, &sk).await?;
     let existing_item: Item = existing_json
         .as_ref()
         .and_then(|j| serde_json::from_str(j).ok())
@@ -444,7 +438,9 @@ fn execute_update(storage: &Storage, update: &TransactUpdate) -> Result<()> {
         .get(&key_schema.partition_key)
         .map(crate::storage::compute_hash_prefix)
         .unwrap_or_default();
-    storage.put_item_with_hash(&update.table_name, &pk, &sk, &item_json, size, &hash_prefix)?;
+    storage
+        .put_item_with_hash(&update.table_name, &pk, &sk, &item_json, size, &hash_prefix)
+        .await?;
 
     let _ = super::gsi::maintain_gsis_after_write(
         storage,
@@ -455,7 +451,8 @@ fn execute_update(storage: &Storage, update: &TransactUpdate) -> Result<()> {
         &item,
         &key_schema.partition_key,
         key_schema.sort_key.as_deref(),
-    )?;
+    )
+    .await?;
 
     super::lsi::maintain_lsis_after_write(
         storage,
@@ -466,18 +463,19 @@ fn execute_update(storage: &Storage, update: &TransactUpdate) -> Result<()> {
         &item,
         &key_schema.partition_key,
         key_schema.sort_key.as_deref(),
-    )?;
+    )
+    .await?;
 
     // Record stream event
     let old_item: Option<Item> = old_for_stream.and_then(|j| serde_json::from_str(&j).ok());
-    crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item))?;
+    crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
 
     Ok(())
 }
 
-fn execute_delete(storage: &Storage, delete: &TransactDelete) -> Result<()> {
+async fn execute_delete<S: StorageBackend>(storage: &S, delete: &TransactDelete) -> Result<()> {
     crate::validation::validate_table_name(&delete.table_name)?;
-    let meta = helpers::require_table_for_item_op(storage, &delete.table_name)?;
+    let meta = helpers::require_table_for_item_op(storage, &delete.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
 
     helpers::validate_key_only(&delete.key, &key_schema)?;
@@ -498,7 +496,7 @@ fn execute_delete(storage: &Storage, delete: &TransactDelete) -> Result<()> {
 
     // Evaluate condition if present
     if let Some(ref cond_expr) = delete.condition_expression {
-        let existing_json = storage.get_item(&delete.table_name, &pk, &sk)?;
+        let existing_json = storage.get_item(&delete.table_name, &pk, &sk).await?;
         let existing_item: Item = existing_json
             .as_ref()
             .and_then(|j| serde_json::from_str(j).ok())
@@ -517,29 +515,33 @@ fn execute_delete(storage: &Storage, delete: &TransactDelete) -> Result<()> {
 
     tracker.check_unused()?;
 
-    let old_json = storage.delete_item(&delete.table_name, &pk, &sk)?;
-    let _ = super::gsi::maintain_gsis_after_delete(storage, &delete.table_name, &meta, &pk, &sk)?;
-    super::lsi::maintain_lsis_after_delete(storage, &delete.table_name, &meta, &pk, &sk)?;
+    let old_json = storage.delete_item(&delete.table_name, &pk, &sk).await?;
+    let _ = super::gsi::maintain_gsis_after_delete(storage, &delete.table_name, &meta, &pk, &sk)
+        .await?;
+    super::lsi::maintain_lsis_after_delete(storage, &delete.table_name, &meta, &pk, &sk).await?;
 
     // Record stream event
     let old_item: Option<Item> = old_json.and_then(|j| serde_json::from_str(&j).ok());
     if old_item.is_some() {
-        crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None)?;
+        crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None).await?;
     }
 
     Ok(())
 }
 
-fn execute_condition_check(storage: &Storage, check: &TransactConditionCheck) -> Result<()> {
+async fn execute_condition_check<S: StorageBackend>(
+    storage: &S,
+    check: &TransactConditionCheck,
+) -> Result<()> {
     crate::validation::validate_table_name(&check.table_name)?;
-    let meta = helpers::require_table_for_item_op(storage, &check.table_name)?;
+    let meta = helpers::require_table_for_item_op(storage, &check.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
 
     helpers::validate_key_only(&check.key, &key_schema)?;
     // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&check.key, &key_schema)?;
 
-    let existing_json = storage.get_item(&check.table_name, &pk, &sk)?;
+    let existing_json = storage.get_item(&check.table_name, &pk, &sk).await?;
     let existing_item: Item = existing_json
         .as_ref()
         .and_then(|j| serde_json::from_str(j).ok())
@@ -619,31 +621,34 @@ fn get_action_table_and_size(item: &TransactWriteItem) -> (String, usize) {
 }
 
 /// Get a unique target key (table + pk + sk) for duplicate detection.
-fn get_item_target(storage: &Storage, item: &TransactWriteItem) -> Result<String> {
+async fn get_item_target<S: StorageBackend>(
+    storage: &S,
+    item: &TransactWriteItem,
+) -> Result<String> {
     if let Some(ref put) = item.put {
         crate::validation::validate_table_name(&put.table_name)?;
-        let meta = helpers::require_table_for_item_op(storage, &put.table_name)?;
+        let meta = helpers::require_table_for_item_op(storage, &put.table_name).await?;
         let key_schema = helpers::parse_key_schema(&meta)?;
         // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
         let (pk, sk) = helpers::extract_key_strings(&put.item, &key_schema)?;
         Ok(format!("{}#{}#{}", put.table_name, pk, sk))
     } else if let Some(ref update) = item.update {
         crate::validation::validate_table_name(&update.table_name)?;
-        let meta = helpers::require_table_for_item_op(storage, &update.table_name)?;
+        let meta = helpers::require_table_for_item_op(storage, &update.table_name).await?;
         let key_schema = helpers::parse_key_schema(&meta)?;
         // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
         let (pk, sk) = helpers::extract_key_strings(&update.key, &key_schema)?;
         Ok(format!("{}#{}#{}", update.table_name, pk, sk))
     } else if let Some(ref delete) = item.delete {
         crate::validation::validate_table_name(&delete.table_name)?;
-        let meta = helpers::require_table_for_item_op(storage, &delete.table_name)?;
+        let meta = helpers::require_table_for_item_op(storage, &delete.table_name).await?;
         let key_schema = helpers::parse_key_schema(&meta)?;
         // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
         let (pk, sk) = helpers::extract_key_strings(&delete.key, &key_schema)?;
         Ok(format!("{}#{}#{}", delete.table_name, pk, sk))
     } else if let Some(ref check) = item.condition_check {
         crate::validation::validate_table_name(&check.table_name)?;
-        let meta = helpers::require_table_for_item_op(storage, &check.table_name)?;
+        let meta = helpers::require_table_for_item_op(storage, &check.table_name).await?;
         let key_schema = helpers::parse_key_schema(&meta)?;
         // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
         let (pk, sk) = helpers::extract_key_strings(&check.key, &key_schema)?;

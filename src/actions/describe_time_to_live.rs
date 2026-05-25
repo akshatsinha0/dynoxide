@@ -1,5 +1,5 @@
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use serde::{Deserialize, Serialize};
 
 /// Internal raw deserialization struct.
@@ -55,8 +55,8 @@ pub struct TimeToLiveDescription {
     pub attribute_name: Option<String>,
 }
 
-pub fn execute(
-    storage: &Storage,
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
     request: DescribeTimeToLiveRequest,
 ) -> Result<DescribeTimeToLiveResponse> {
     // Table name format validation already done in Deserialize impl;
@@ -64,7 +64,8 @@ pub fn execute(
     crate::validation::validate_table_name(&request.table_name)?;
 
     let meta = storage
-        .get_table_metadata(&request.table_name)?
+        .get_table_metadata(&request.table_name)
+        .await?
         .ok_or_else(|| {
             DynoxideError::ResourceNotFoundException(format!(
                 "Requested resource not found: Table: {} not found",

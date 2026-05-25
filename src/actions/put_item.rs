@@ -1,6 +1,6 @@
 use crate::actions::helpers;
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{self, AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -144,7 +144,10 @@ pub struct PutItemResponse {
     pub item_collection_metrics: Option<crate::types::ItemCollectionMetrics>,
 }
 
-pub fn execute(storage: &Storage, mut request: PutItemRequest) -> Result<PutItemResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    mut request: PutItemRequest,
+) -> Result<PutItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
 
@@ -235,7 +238,7 @@ pub fn execute(storage: &Storage, mut request: PutItemRequest) -> Result<PutItem
         ));
     }
 
-    let meta = helpers::require_table_for_item_op(storage, &request.table_name)?;
+    let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
 
     // Convert legacy Expected parameter to ConditionExpression if no expression is set
@@ -291,16 +294,15 @@ pub fn execute(storage: &Storage, mut request: PutItemRequest) -> Result<PutItem
         }
     }
 
-    // Wrap condition check + write in a transaction to prevent TOCTOU races
-    let has_condition = request.condition_expression.is_some();
-    if has_condition {
-        storage.begin_transaction()?;
-    }
-
-    let conditional_result = (|| -> Result<(Option<String>, String)> {
+    // Wrap the condition check, base write and the GSI/LSI index fan-out in a
+    // single transaction so a mid-fan-out failure rolls the whole write back,
+    // leaving no torn index. The transaction is unconditional (not just for
+    // ConditionExpression) because the atomicity guarantee applies to every
+    // single-item write.
+    let (old_json, gsi_units) = helpers::with_write_transaction(storage, async {
         // Evaluate ConditionExpression against existing item (if any)
         let old_json = if request.condition_expression.is_some() {
-            let existing_json = storage.get_item(&request.table_name, &pk, &sk)?;
+            let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
             let existing_item: HashMap<String, AttributeValue> = existing_json
                 .as_ref()
                 .and_then(|j| serde_json::from_str(j).ok())
@@ -349,74 +351,70 @@ pub fn execute(storage: &Storage, mut request: PutItemRequest) -> Result<PutItem
         // Store item (returns old item if it existed)
         // If we already fetched old_json for condition check, use put_item but ignore its return
         let old_json = if old_json.is_some() {
-            storage.put_item_with_hash(
-                &request.table_name,
-                &pk,
-                &sk,
-                &item_json,
-                size,
-                &hash_prefix,
-            )?;
+            storage
+                .put_item_with_hash(
+                    &request.table_name,
+                    &pk,
+                    &sk,
+                    &item_json,
+                    size,
+                    &hash_prefix,
+                )
+                .await?;
             old_json
         } else {
-            storage.put_item_with_hash(
-                &request.table_name,
-                &pk,
-                &sk,
-                &item_json,
-                size,
-                &hash_prefix,
-            )?
+            storage
+                .put_item_with_hash(
+                    &request.table_name,
+                    &pk,
+                    &sk,
+                    &item_json,
+                    size,
+                    &hash_prefix,
+                )
+                .await?
         };
 
-        Ok((old_json, item_json))
-    })();
+        // Maintain GSI tables (inside the transaction)
+        let gsi_units = super::gsi::maintain_gsis_after_write(
+            storage,
+            &request.table_name,
+            &meta,
+            &pk,
+            &sk,
+            &request.item,
+            &key_schema.partition_key,
+            key_schema.sort_key.as_deref(),
+        )
+        .await?;
 
-    // Handle transaction commit/rollback
-    if has_condition {
-        match conditional_result {
-            Ok(_) => storage.commit()?,
-            Err(ref _e) => {
-                let _ = storage.rollback();
-            }
-        }
-    }
+        // Maintain LSI tables (inside the transaction)
+        super::lsi::maintain_lsis_after_write(
+            storage,
+            &request.table_name,
+            &meta,
+            &pk,
+            &sk,
+            &request.item,
+            &key_schema.partition_key,
+            key_schema.sort_key.as_deref(),
+        )
+        .await?;
 
-    let (old_json, _item_json) = conditional_result?;
+        // Record stream event (inside the transaction)
+        let old_item_for_stream: Option<Item> =
+            old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
+        crate::streams::record_stream_event(
+            storage,
+            &meta,
+            old_item_for_stream.as_ref(),
+            Some(&request.item),
+        )
+        .await?;
 
-    // Maintain GSI tables
-    let gsi_units = super::gsi::maintain_gsis_after_write(
-        storage,
-        &request.table_name,
-        &meta,
-        &pk,
-        &sk,
-        &request.item,
-        &key_schema.partition_key,
-        key_schema.sort_key.as_deref(),
-    )?;
-
-    // Maintain LSI tables
-    super::lsi::maintain_lsis_after_write(
-        storage,
-        &request.table_name,
-        &meta,
-        &pk,
-        &sk,
-        &request.item,
-        &key_schema.partition_key,
-        key_schema.sort_key.as_deref(),
-    )?;
-
-    // Record stream event
-    let old_item_for_stream: Option<Item> =
-        old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
-    crate::streams::record_stream_event(
-        storage,
-        &meta,
-        old_item_for_stream.as_ref(),
-        Some(&request.item),
-    )?;
+        Ok((old_json, gsi_units))
+    })
+    .await?;
 
     // Handle ReturnValues
     let return_old = request
@@ -445,7 +443,8 @@ pub fn execute(storage: &Storage, mut request: PutItemRequest) -> Result<PutItem
             .as_ref()
             .unwrap_or(&AttributeValue::S(String::new())),
         &request.return_item_collection_metrics,
-    )?;
+    )
+    .await?;
 
     let consumed_capacity = types::consumed_capacity_with_indexes(
         &request.table_name,
@@ -459,4 +458,90 @@ pub fn execute(storage: &Storage, mut request: PutItemRequest) -> Result<PutItem
         consumed_capacity,
         item_collection_metrics,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::actions::{create_table, put_item};
+    use crate::storage::Storage;
+    use crate::storage_backend::StorageBackend;
+
+    /// A single-item write and its GSI fan-out succeed or fail as one unit:
+    /// when a later GSI write fails mid-fan-out, the base write and the GSI
+    /// entry already written earlier in the same transaction both roll back.
+    #[test]
+    fn put_item_rolls_back_base_write_when_gsi_fan_out_fails() {
+        let storage = Storage::memory().unwrap();
+
+        let create = serde_json::from_value(serde_json::json!({
+            "TableName": "Orders",
+            "KeySchema": [
+                {"AttributeName": "UserId", "KeyType": "HASH"},
+                {"AttributeName": "Timestamp", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "UserId", "AttributeType": "S"},
+                {"AttributeName": "Timestamp", "AttributeType": "S"},
+                {"AttributeName": "Status", "AttributeType": "S"},
+                {"AttributeName": "Priority", "AttributeType": "S"}
+            ],
+            "GlobalSecondaryIndexes": [
+                {
+                    "IndexName": "StatusIndex",
+                    "KeySchema": [{"AttributeName": "Status", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"}
+                },
+                {
+                    "IndexName": "PriorityIndex",
+                    "KeySchema": [{"AttributeName": "Priority", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"}
+                }
+            ]
+        }))
+        .unwrap();
+        pollster::block_on(create_table::execute(&storage, create)).unwrap();
+
+        // Inject a fan-out failure: drop the second GSI's physical table while
+        // its metadata stays. The fan-out maintains StatusIndex first (which
+        // succeeds inside the transaction), then hits the now-missing
+        // PriorityIndex table and errors.
+        storage.drop_gsi_table("Orders", "PriorityIndex").unwrap();
+
+        let put = serde_json::from_value(serde_json::json!({
+            "TableName": "Orders",
+            "Item": {
+                "UserId": {"S": "user1"},
+                "Timestamp": {"S": "2024-01-01"},
+                "Status": {"S": "SHIPPED"},
+                "Priority": {"S": "HIGH"}
+            }
+        }))
+        .unwrap();
+        let res = pollster::block_on(put_item::execute(&storage, put));
+        assert!(
+            res.is_err(),
+            "a mid-fan-out failure must surface as an error"
+        );
+
+        // The base write must roll back entirely.
+        let count =
+            pollster::block_on(<Storage as StorageBackend>::count_items(&storage, "Orders"))
+                .unwrap();
+        assert_eq!(count, 0, "base write must roll back when fan-out fails");
+
+        // The first GSI's entry, written before the failure, must roll back too
+        // (no torn index).
+        let g1 = pollster::block_on(<Storage as StorageBackend>::query_gsi_items(
+            &storage,
+            "Orders",
+            "StatusIndex",
+            "SHIPPED",
+            &Default::default(),
+        ))
+        .unwrap();
+        assert!(
+            g1.is_empty(),
+            "first GSI entry must roll back with the base write"
+        );
+    }
 }

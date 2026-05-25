@@ -52,6 +52,7 @@ pub mod server;
 #[cfg(feature = "mcp-server")]
 pub(crate) mod snapshots;
 pub mod storage;
+pub mod storage_backend;
 pub mod streams;
 pub mod ttl;
 pub mod types;
@@ -66,6 +67,7 @@ use std::time::Instant;
 
 pub use errors::{DynoxideError, Result};
 pub use storage::{DatabaseInfo, TableInfoEntry, TableMetadata, TableStats};
+pub use storage_backend::BackendError;
 pub use types::{AttributeValue, ConversionError, Item};
 
 /// Options for `Database::import_items()`.
@@ -96,17 +98,45 @@ type TokenCache = HashMap<
     ),
 >;
 
+/// The native storage backend: the rusqlite-backed [`storage::Storage`].
+///
+/// `Database`'s type parameter defaults to this, so existing native callers
+/// keep writing `Database` and get the synchronous rusqlite-backed engine.
+pub type RusqliteBackend = storage::Storage;
+
+/// The native, synchronous `Database`.
+///
+/// Alias for the default [`Database`] monomorphisation over
+/// [`RusqliteBackend`]. It exposes the historical synchronous public API
+/// unchanged: each method drives an async handler future to completion with
+/// `block_on`. Because the native backend's futures never suspend, that
+/// `block_on` never parks the thread.
+pub type NativeDatabase = Database<RusqliteBackend>;
+
 /// The main entry point for the DynamoDB emulator.
 ///
-/// Wraps a SQLite-backed storage layer and provides DynamoDB-compatible
-/// operations. Thread-safe via `Arc<Mutex<>>` — clone freely across threads.
-#[derive(Clone)]
-pub struct Database {
-    inner: Arc<Mutex<storage::Storage>>,
+/// Generic over the storage backend `S`, monomorphised (no `dyn`). The type
+/// parameter defaults to [`RusqliteBackend`], so `Database` means the native
+/// engine and the public synchronous API is preserved via [`NativeDatabase`].
+///
+/// Wraps a storage layer and provides DynamoDB-compatible operations.
+/// Thread-safe via `Arc<Mutex<>>`, so clone freely across threads.
+pub struct Database<S = RusqliteBackend> {
+    inner: Arc<Mutex<S>>,
     idempotency_tokens: Arc<Mutex<TokenCache>>,
 }
 
-impl Database {
+// Hand-written so cloning never requires `S: Clone`; only the `Arc`s clone.
+impl<S> Clone for Database<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            idempotency_tokens: Arc::clone(&self.idempotency_tokens),
+        }
+    }
+}
+
+impl Database<RusqliteBackend> {
     /// Open a persistent database at the given path.
     pub fn new(path: &str) -> Result<Self> {
         let storage = storage::Storage::new(path)?;
@@ -193,7 +223,7 @@ impl Database {
         &self,
         request: actions::create_table::CreateTableRequest,
     ) -> Result<actions::create_table::CreateTableResponse> {
-        self.with_storage(|s| actions::create_table::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::create_table::execute(s, request)))
     }
 
     /// Delete a DynamoDB table.
@@ -201,7 +231,7 @@ impl Database {
         &self,
         request: actions::delete_table::DeleteTableRequest,
     ) -> Result<actions::delete_table::DeleteTableResponse> {
-        self.with_storage(|s| actions::delete_table::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::delete_table::execute(s, request)))
     }
 
     /// Describe a DynamoDB table.
@@ -209,7 +239,7 @@ impl Database {
         &self,
         request: actions::describe_table::DescribeTableRequest,
     ) -> Result<actions::describe_table::DescribeTableResponse> {
-        self.with_storage(|s| actions::describe_table::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::describe_table::execute(s, request)))
     }
 
     /// Update a DynamoDB table (add/remove GSIs).
@@ -217,7 +247,7 @@ impl Database {
         &self,
         request: actions::update_table::UpdateTableRequest,
     ) -> Result<actions::update_table::UpdateTableResponse> {
-        self.with_storage(|s| actions::update_table::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::update_table::execute(s, request)))
     }
 
     /// List DynamoDB tables.
@@ -225,7 +255,7 @@ impl Database {
         &self,
         request: actions::list_tables::ListTablesRequest,
     ) -> Result<actions::list_tables::ListTablesResponse> {
-        self.with_storage(|s| actions::list_tables::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::list_tables::execute(s, request)))
     }
 
     // -------------------------------------------------------------------
@@ -237,7 +267,7 @@ impl Database {
         &self,
         request: actions::tag_resource::TagResourceRequest,
     ) -> Result<actions::tag_resource::TagResourceResponse> {
-        self.with_storage(|s| actions::tag_resource::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::tag_resource::execute(s, request)))
     }
 
     /// Remove tags from a DynamoDB table.
@@ -245,7 +275,7 @@ impl Database {
         &self,
         request: actions::untag_resource::UntagResourceRequest,
     ) -> Result<actions::untag_resource::UntagResourceResponse> {
-        self.with_storage(|s| actions::untag_resource::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::untag_resource::execute(s, request)))
     }
 
     /// List tags for a DynamoDB table.
@@ -253,7 +283,9 @@ impl Database {
         &self,
         request: actions::list_tags_of_resource::ListTagsOfResourceRequest,
     ) -> Result<actions::list_tags_of_resource::ListTagsOfResourceResponse> {
-        self.with_storage(|s| actions::list_tags_of_resource::execute(s, request))
+        self.with_storage(|s| {
+            pollster::block_on(actions::list_tags_of_resource::execute(s, request))
+        })
     }
 
     // -------------------------------------------------------------------
@@ -265,7 +297,7 @@ impl Database {
         &self,
         request: actions::put_item::PutItemRequest,
     ) -> Result<actions::put_item::PutItemResponse> {
-        self.with_storage(|s| actions::put_item::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::put_item::execute(s, request)))
     }
 
     /// Get an item from a DynamoDB table.
@@ -273,7 +305,7 @@ impl Database {
         &self,
         request: actions::get_item::GetItemRequest,
     ) -> Result<actions::get_item::GetItemResponse> {
-        self.with_storage(|s| actions::get_item::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::get_item::execute(s, request)))
     }
 
     /// Delete an item from a DynamoDB table.
@@ -281,7 +313,7 @@ impl Database {
         &self,
         request: actions::delete_item::DeleteItemRequest,
     ) -> Result<actions::delete_item::DeleteItemResponse> {
-        self.with_storage(|s| actions::delete_item::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::delete_item::execute(s, request)))
     }
 
     /// Update an item in a DynamoDB table.
@@ -289,7 +321,7 @@ impl Database {
         &self,
         request: actions::update_item::UpdateItemRequest,
     ) -> Result<actions::update_item::UpdateItemResponse> {
-        self.with_storage(|s| actions::update_item::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::update_item::execute(s, request)))
     }
 
     // -------------------------------------------------------------------
@@ -301,7 +333,7 @@ impl Database {
         &self,
         request: actions::batch_get_item::BatchGetItemRequest,
     ) -> Result<actions::batch_get_item::BatchGetItemResponse> {
-        self.with_storage(|s| actions::batch_get_item::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::batch_get_item::execute(s, request)))
     }
 
     /// Batch write items to one or more DynamoDB tables.
@@ -309,7 +341,7 @@ impl Database {
         &self,
         request: actions::batch_write_item::BatchWriteItemRequest,
     ) -> Result<actions::batch_write_item::BatchWriteItemResponse> {
-        self.with_storage(|s| actions::batch_write_item::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::batch_write_item::execute(s, request)))
     }
 
     /// Import items in bulk, bypassing per-item size validation.
@@ -332,7 +364,11 @@ impl Database {
         items: Vec<Item>,
         options: ImportOptions,
     ) -> Result<ImportResult> {
-        self.with_storage(|s| actions::import_items::execute(s, table_name, items, &options))
+        self.with_storage(|s| {
+            pollster::block_on(actions::import_items::execute(
+                s, table_name, items, &options,
+            ))
+        })
     }
 
     /// Import items in bulk, skipping GSI DELETE-before-INSERT.
@@ -348,7 +384,9 @@ impl Database {
         options: ImportOptions,
     ) -> Result<ImportResult> {
         self.with_storage(|s| {
-            actions::import_items::execute_skip_gsi_deletes(s, table_name, items, &options)
+            pollster::block_on(actions::import_items::execute_skip_gsi_deletes(
+                s, table_name, items, &options,
+            ))
         })
     }
 
@@ -378,12 +416,12 @@ impl Database {
         &self,
         request: actions::query::QueryRequest,
     ) -> Result<actions::query::QueryResponse> {
-        self.with_storage(|s| actions::query::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::query::execute(s, request)))
     }
 
     /// Scan a DynamoDB table.
     pub fn scan(&self, request: actions::scan::ScanRequest) -> Result<actions::scan::ScanResponse> {
-        self.with_storage(|s| actions::scan::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::scan::execute(s, request)))
     }
 
     // -------------------------------------------------------------------
@@ -441,8 +479,9 @@ impl Database {
             }
         }
 
-        let resp =
-            self.with_storage(|s| actions::transact_write_items::execute(s, request.clone()))?;
+        let resp = self.with_storage(|s| {
+            pollster::block_on(actions::transact_write_items::execute(s, request.clone()))
+        })?;
 
         // Cache the response if token was provided
         if let Some(ref token) = request.client_request_token {
@@ -459,7 +498,7 @@ impl Database {
         &self,
         request: actions::transact_get_items::TransactGetItemsRequest,
     ) -> Result<actions::transact_get_items::TransactGetItemsResponse> {
-        self.with_storage(|s| actions::transact_get_items::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::transact_get_items::execute(s, request)))
     }
 
     // -------------------------------------------------------------------
@@ -471,7 +510,7 @@ impl Database {
         &self,
         request: actions::list_streams::ListStreamsRequest,
     ) -> Result<actions::list_streams::ListStreamsResponse> {
-        self.with_storage(|s| actions::list_streams::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::list_streams::execute(s, request)))
     }
 
     /// Describe a DynamoDB Stream.
@@ -479,7 +518,7 @@ impl Database {
         &self,
         request: actions::describe_stream::DescribeStreamRequest,
     ) -> Result<actions::describe_stream::DescribeStreamResponse> {
-        self.with_storage(|s| actions::describe_stream::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::describe_stream::execute(s, request)))
     }
 
     /// Get a shard iterator.
@@ -487,7 +526,7 @@ impl Database {
         &self,
         request: actions::get_shard_iterator::GetShardIteratorRequest,
     ) -> Result<actions::get_shard_iterator::GetShardIteratorResponse> {
-        self.with_storage(|s| actions::get_shard_iterator::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::get_shard_iterator::execute(s, request)))
     }
 
     /// Get stream records.
@@ -495,7 +534,7 @@ impl Database {
         &self,
         request: actions::get_records::GetRecordsRequest,
     ) -> Result<actions::get_records::GetRecordsResponse> {
-        self.with_storage(|s| actions::get_records::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::get_records::execute(s, request)))
     }
 
     // -------------------------------------------------------------------
@@ -507,7 +546,7 @@ impl Database {
         &self,
         request: actions::update_time_to_live::UpdateTimeToLiveRequest,
     ) -> Result<actions::update_time_to_live::UpdateTimeToLiveResponse> {
-        self.with_storage(|s| actions::update_time_to_live::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::update_time_to_live::execute(s, request)))
     }
 
     /// Describe time to live configuration.
@@ -515,13 +554,15 @@ impl Database {
         &self,
         request: actions::describe_time_to_live::DescribeTimeToLiveRequest,
     ) -> Result<actions::describe_time_to_live::DescribeTimeToLiveResponse> {
-        self.with_storage(|s| actions::describe_time_to_live::execute(s, request))
+        self.with_storage(|s| {
+            pollster::block_on(actions::describe_time_to_live::execute(s, request))
+        })
     }
 
     /// Run a TTL sweep, deleting expired items from all TTL-enabled tables.
     /// Returns the number of items deleted.
     pub fn sweep_ttl(&self) -> Result<usize> {
-        self.with_storage(ttl::sweep_expired_items)
+        self.with_storage(|s| pollster::block_on(ttl::sweep_expired_items(s)))
     }
 
     // -------------------------------------------------------------------
@@ -533,7 +574,7 @@ impl Database {
         &self,
         request: actions::execute_statement::ExecuteStatementRequest,
     ) -> Result<actions::execute_statement::ExecuteStatementResponse> {
-        self.with_storage(|s| actions::execute_statement::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::execute_statement::execute(s, request)))
     }
 
     /// Execute PartiQL statements transactionally (all-or-nothing).
@@ -541,7 +582,7 @@ impl Database {
         &self,
         request: actions::execute_transaction::ExecuteTransactionRequest,
     ) -> Result<actions::execute_transaction::ExecuteTransactionResponse> {
-        self.with_storage(|s| actions::execute_transaction::execute(s, request))
+        self.with_storage(|s| pollster::block_on(actions::execute_transaction::execute(s, request)))
     }
 
     /// Execute a batch of PartiQL statements.
@@ -549,7 +590,9 @@ impl Database {
         &self,
         request: actions::batch_execute_statement::BatchExecuteStatementRequest,
     ) -> Result<actions::batch_execute_statement::BatchExecuteStatementResponse> {
-        self.with_storage(|s| actions::batch_execute_statement::execute(s, request))
+        self.with_storage(|s| {
+            pollster::block_on(actions::batch_execute_statement::execute(s, request))
+        })
     }
 
     // -------------------------------------------------------------------
@@ -691,5 +734,50 @@ mod tests {
 
         let tables = handle.join().unwrap();
         assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn test_native_database_alias_round_trips() {
+        // The `NativeDatabase` alias is the default `Database<RusqliteBackend>`
+        // and must drive the async handlers through the synchronous facade
+        // transparently: a put/get round-trip behaves exactly as before.
+        let db: NativeDatabase = Database::memory().unwrap();
+
+        db.create_table(actions::create_table::CreateTableRequest {
+            table_name: "tbl".to_string(),
+            key_schema: vec![types::KeySchemaElement {
+                attribute_name: "pk".to_string(),
+                key_type: types::KeyType::HASH,
+            }],
+            attribute_definitions: vec![types::AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: types::ScalarAttributeType::S,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), AttributeValue::S("a".to_string()));
+        db.put_item(actions::put_item::PutItemRequest {
+            table_name: "tbl".to_string(),
+            item,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut key = HashMap::new();
+        key.insert("pk".to_string(), AttributeValue::S("a".to_string()));
+        let got = db
+            .get_item(actions::get_item::GetItemRequest {
+                table_name: "tbl".to_string(),
+                key,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            got.item.unwrap().get("pk"),
+            Some(&AttributeValue::S("a".to_string()))
+        );
     }
 }

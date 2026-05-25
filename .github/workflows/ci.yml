@@ -79,6 +79,18 @@ jobs:
             exit 1
           fi
 
+  wasm-stub-check:
+    name: wasm-stub trait-shape check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check --features wasm-stub
+        run: cargo check --features wasm-stub --lib
+
   # Gate the Docker smoke test on the paths that can actually break the
   # documented MCP-in-Docker recipe. src/main.rs carries the ServeArgs/McpArgs
   # flag plumbing and Cargo.{toml,lock} the feature set / rmcp version — both can

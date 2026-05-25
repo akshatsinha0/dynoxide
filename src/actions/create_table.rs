@@ -1,6 +1,6 @@
 use crate::actions::{TableDescription, build_table_description};
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::streams;
 use crate::types::{
     AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, KeyType, LocalSecondaryIndex,
@@ -85,7 +85,10 @@ pub struct CreateTableResponse {
     pub table_description: TableDescription,
 }
 
-pub fn execute(storage: &Storage, request: CreateTableRequest) -> Result<CreateTableResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    request: CreateTableRequest,
+) -> Result<CreateTableResponse> {
     // Structural validation (runs for both programmatic and JSON paths)
     validate_typed_request(&request)?;
 
@@ -99,7 +102,7 @@ pub fn execute(storage: &Storage, request: CreateTableRequest) -> Result<CreateT
         }
     }
 
-    if storage.table_exists(&request.table_name)? {
+    if storage.table_exists(&request.table_name).await? {
         return Err(DynoxideError::ResourceInUseException(format!(
             "Table already exists: {}",
             request.table_name
@@ -142,31 +145,37 @@ pub fn execute(storage: &Storage, request: CreateTableRequest) -> Result<CreateT
     let deletion_protection = request.deletion_protection_enabled.unwrap_or(false);
 
     let billing_mode_str = request.billing_mode.as_deref().unwrap_or("PROVISIONED");
-    storage.insert_table_metadata(&crate::storage::CreateTableMetadata {
-        table_name: &request.table_name,
-        key_schema: &key_schema_json,
-        attribute_definitions: &attr_defs_json,
-        gsi_definitions: gsi_json.as_deref(),
-        lsi_definitions: lsi_json.as_deref(),
-        provisioned_throughput: pt_json.as_deref(),
-        created_at: now,
-        sse_specification: sse_json.as_deref(),
-        table_class: request.table_class.as_deref(),
-        deletion_protection_enabled: deletion_protection,
-        billing_mode: Some(billing_mode_str),
-    })?;
+    storage
+        .insert_table_metadata(&crate::storage::CreateTableMetadata {
+            table_name: &request.table_name,
+            key_schema: &key_schema_json,
+            attribute_definitions: &attr_defs_json,
+            gsi_definitions: gsi_json.as_deref(),
+            lsi_definitions: lsi_json.as_deref(),
+            provisioned_throughput: pt_json.as_deref(),
+            created_at: now,
+            sse_specification: sse_json.as_deref(),
+            table_class: request.table_class.as_deref(),
+            deletion_protection_enabled: deletion_protection,
+            billing_mode: Some(billing_mode_str),
+        })
+        .await?;
 
-    storage.create_data_table(&request.table_name)?;
+    storage.create_data_table(&request.table_name).await?;
 
     if let Some(ref gsis) = request.global_secondary_indexes {
         for gsi in gsis {
-            storage.create_gsi_table(&request.table_name, &gsi.index_name)?;
+            storage
+                .create_gsi_table(&request.table_name, &gsi.index_name)
+                .await?;
         }
     }
 
     if let Some(ref lsis) = request.local_secondary_indexes {
         for lsi in lsis {
-            storage.create_lsi_table(&request.table_name, &lsi.index_name)?;
+            storage
+                .create_lsi_table(&request.table_name, &lsi.index_name)
+                .await?;
         }
     }
 
@@ -176,19 +185,22 @@ pub fn execute(storage: &Storage, request: CreateTableRequest) -> Result<CreateT
                 .stream_view_type
                 .as_deref()
                 .unwrap_or("NEW_AND_OLD_IMAGES");
-            let label = streams::generate_stream_label();
-            storage.enable_stream(&request.table_name, view_type, &label)?;
+            let label = streams::generate_stream_label(storage.clock());
+            storage
+                .enable_stream(&request.table_name, view_type, &label)
+                .await?;
         }
     }
 
     if let Some(ref tags) = request.tags {
         if !tags.is_empty() {
-            storage.set_tags(&request.table_name, tags)?;
+            storage.set_tags(&request.table_name, tags).await?;
         }
     }
 
     let meta = storage
-        .get_table_metadata(&request.table_name)?
+        .get_table_metadata(&request.table_name)
+        .await?
         .ok_or_else(|| {
             DynoxideError::InternalServerError("Table metadata not found after creation".into())
         })?;

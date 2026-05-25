@@ -1,5 +1,5 @@
 use crate::errors::Result;
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::streams;
 use serde::{Deserialize, Serialize};
 
@@ -34,8 +34,11 @@ pub struct StreamSummary {
     pub stream_label: String,
 }
 
-pub fn execute(storage: &Storage, request: ListStreamsRequest) -> Result<ListStreamsResponse> {
-    let tables = storage.list_stream_enabled_tables()?;
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    request: ListStreamsRequest,
+) -> Result<ListStreamsResponse> {
+    let tables = storage.list_stream_enabled_tables().await?;
 
     let mut summaries: Vec<StreamSummary> = tables
         .into_iter()

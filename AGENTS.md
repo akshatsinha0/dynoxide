@@ -100,11 +100,17 @@ helps a reviewer but are not required.
 
 ## Storage layer boundary
 
-The storage layer (`src/storage.rs` and related) is scheduled for a
-significant refactor before 1.0: the `Database` type will become
-generic over a `StorageBackend` trait. Please open an issue before
-submitting changes in this area; we can advise whether your change
-fits the current architecture, the planned one, or is best deferred.
+The data layer goes through the `StorageBackend` trait in
+`src/storage_backend/`; the native rusqlite-backed `Storage` implements it.
+The action handlers are async and generic over the trait
+(`execute<S: StorageBackend>`), and `Database` is `Database<S = RusqliteBackend>`
+with a `NativeDatabase` alias that preserves the historical synchronous public
+API through a `block_on` facade. The trait is consumed monomorphically (no
+`dyn`); a non-native (browser / WASM) backend is the next consumer. The raw
+`Storage::conn()` / `conn_mut()` escape hatches are no longer used by action
+handlers. Please open an issue before submitting changes to `src/storage.rs`
+or `src/storage_backend/`; we can advise whether your change fits the current
+shape or is better held until the next pass.
 
 ## Where to discuss
 

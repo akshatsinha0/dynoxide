@@ -1,9 +1,51 @@
 use crate::errors::{DynoxideError, Result};
-use crate::storage::{Storage, TableMetadata};
+use crate::storage::TableMetadata;
+use crate::storage_backend::StorageBackend;
 use crate::types::{
     AttributeDefinition, AttributeValue, KeySchemaElement, KeyType, ScalarAttributeType,
 };
 use std::collections::HashMap;
+use std::future::Future;
+
+/// Run `body` inside a single backend write transaction.
+///
+/// Commits on success; if the commit itself fails, rolls back and surfaces the
+/// failure rather than leaving the connection stuck mid-transaction (a leftover
+/// open transaction makes the next `begin_transaction` fail). On any error from
+/// `body`, rolls back; if that rollback also fails, surfaces a combined error.
+///
+/// This is the single place the write-transaction lifecycle policy lives, so
+/// every write path handles a failed commit or rollback identically.
+pub async fn with_write_transaction<S, T, F>(storage: &S, body: F) -> Result<T>
+where
+    S: StorageBackend,
+    F: Future<Output = Result<T>>,
+{
+    storage.begin_transaction().await?;
+    match body.await {
+        Ok(value) => match storage.commit().await {
+            Ok(()) => Ok(value),
+            Err(commit_err) => {
+                if let Err(rb_err) = storage.rollback().await {
+                    Err(DynoxideError::InternalServerError(format!(
+                        "commit failed ({commit_err}) and rollback also failed ({rb_err})"
+                    )))
+                } else {
+                    Err(commit_err.into())
+                }
+            }
+        },
+        Err(e) => {
+            if let Err(rb_err) = storage.rollback().await {
+                Err(DynoxideError::InternalServerError(format!(
+                    "operation failed ({e}) and rollback also failed ({rb_err})"
+                )))
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
 
 /// Parsed key schema for convenient access.
 pub struct KeySchema {
@@ -14,21 +56,33 @@ pub struct KeySchema {
 }
 
 /// Require that a table exists, returning its metadata.
-pub fn require_table(storage: &Storage, table_name: &str) -> Result<TableMetadata> {
-    storage.get_table_metadata(table_name)?.ok_or_else(|| {
-        DynoxideError::ResourceNotFoundException(format!(
-            "Requested resource not found: Table: {table_name} not found"
-        ))
-    })
+pub async fn require_table<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+) -> Result<TableMetadata> {
+    storage
+        .get_table_metadata(table_name)
+        .await?
+        .ok_or_else(|| {
+            DynoxideError::ResourceNotFoundException(format!(
+                "Requested resource not found: Table: {table_name} not found"
+            ))
+        })
 }
 
 /// Like `require_table`, but uses the shorter error message format that DynamoDB
 /// uses for item-level operations (PutItem, GetItem, DeleteItem, UpdateItem,
 /// Query, Scan, BatchGetItem, BatchWriteItem).
-pub fn require_table_for_item_op(storage: &Storage, table_name: &str) -> Result<TableMetadata> {
-    storage.get_table_metadata(table_name)?.ok_or_else(|| {
-        DynoxideError::ResourceNotFoundException("Requested resource not found".to_string())
-    })
+pub async fn require_table_for_item_op<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+) -> Result<TableMetadata> {
+    storage
+        .get_table_metadata(table_name)
+        .await?
+        .ok_or_else(|| {
+            DynoxideError::ResourceNotFoundException("Requested resource not found".to_string())
+        })
 }
 
 /// Parse key schema and attribute definitions from table metadata.
@@ -674,8 +728,8 @@ pub fn parse_table_name_from_arn(arn: &str) -> Result<&str> {
 /// Build `ItemCollectionMetrics` if requested and the table has LSIs.
 ///
 /// Returns `None` if the request did not ask for SIZE, or if the table has no LSIs.
-pub fn build_item_collection_metrics(
-    storage: &Storage,
+pub async fn build_item_collection_metrics<S: StorageBackend>(
+    storage: &S,
     meta: &TableMetadata,
     table_name: &str,
     pk_str: &str,
@@ -688,15 +742,16 @@ pub fn build_item_collection_metrics(
         return Ok(None);
     }
 
-    let mut partition_bytes = storage.get_partition_size(table_name, pk_str)?;
+    let mut partition_bytes = storage.get_partition_size(table_name, pk_str).await?;
 
     // Include LSI table sizes — DynamoDB's 10GB item collection limit applies
     // to the aggregate across base table and all LSIs.
     if let Some(ref lsi_json) = meta.lsi_definitions {
         if let Ok(lsis) = serde_json::from_str::<Vec<crate::types::LocalSecondaryIndex>>(lsi_json) {
             for lsi in &lsis {
-                let lsi_size =
-                    storage.get_lsi_partition_size(table_name, &lsi.index_name, pk_str)?;
+                let lsi_size = storage
+                    .get_lsi_partition_size(table_name, &lsi.index_name, pk_str)
+                    .await?;
                 partition_bytes += lsi_size;
             }
         }

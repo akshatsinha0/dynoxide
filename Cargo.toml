@@ -1,6 +1,6 @@
 [package]
 name = "dynoxide-rs"
-version = "0.9.13"
+version = "0.10.0"
 edition = "2024"
 description = "A lightweight, embeddable DynamoDB emulator backed by SQLite"
 license = "MIT OR Apache-2.0"
@@ -26,6 +26,11 @@ encrypted-full = ["encryption", "http-server", "mcp-server", "import"]
 mcp-server = ["dep:rmcp", "dep:schemars", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:clap", "dep:tracing", "dep:tracing-subscriber", "dep:libc", "dep:directories", "dep:subtle"]
 import = ["dep:clap", "dep:toml", "dep:fake", "dep:sha2", "dep:flate2", "dep:indicatif", "dep:zstd", "dep:tempfile"]
 
+# Compile-only wa-sqlite stub. Surfaces trait-shape drift at type-check
+# time so a real wa-sqlite backend does not absorb that drift later. Not
+# a working backend; bodies are unimplemented!().
+wasm-stub = []
+
 # Backward-compatible alias — identical to default features
 full = ["native-sqlite", "http-server", "mcp-server", "import"]
 
@@ -38,6 +43,10 @@ base64 = "0.22"
 bigdecimal = "0.4"
 uuid = { version = "1", features = ["v4", "v7"] }
 md5 = "0.7"
+# Drives the always-ready native handler futures to completion for the
+# synchronous `Database` facade. A minimal block_on that never spawns threads,
+# so it is safe to call from inside the tokio-based HTTP/MCP servers.
+pollster = "0.4"
 
 # Optional encryption dependency
 zeroize = { version = "1", optional = true }

@@ -1,5 +1,5 @@
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::Item;
 use serde::{Deserialize, Serialize};
 
@@ -63,24 +63,32 @@ pub struct StreamRecord {
     pub approximate_creation_date_time: f64,
 }
 
-pub fn execute(storage: &Storage, request: GetRecordsRequest) -> Result<GetRecordsResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    request: GetRecordsRequest,
+) -> Result<GetRecordsResponse> {
     let (table_name, shard_id, position) = super::get_shard_iterator::decode_shard_iterator(
         &request.shard_iterator,
     )
     .ok_or_else(|| DynoxideError::ValidationException("Invalid shard iterator".to_string()))?;
 
-    let meta = storage.get_table_metadata(&table_name)?.ok_or_else(|| {
-        DynoxideError::ResourceNotFoundException(format!(
-            "Requested resource not found: Table: {table_name}"
-        ))
-    })?;
+    let meta = storage
+        .get_table_metadata(&table_name)
+        .await?
+        .ok_or_else(|| {
+            DynoxideError::ResourceNotFoundException(format!(
+                "Requested resource not found: Table: {table_name}"
+            ))
+        })?;
 
     let view_type = meta
         .stream_view_type
         .unwrap_or_else(|| "NEW_AND_OLD_IMAGES".to_string());
 
     let limit = request.limit.unwrap_or(1000).min(1000);
-    let raw_records = storage.get_stream_records(&table_name, &shard_id, position, limit)?;
+    let raw_records = storage
+        .get_stream_records(&table_name, &shard_id, position, limit)
+        .await?;
 
     let mut records = Vec::with_capacity(raw_records.len());
     let mut last_seq: i64 = position;

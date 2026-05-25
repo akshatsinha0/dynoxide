@@ -1,6 +1,7 @@
+use crate::actions::helpers;
 use crate::errors::{CancellationReason, DynoxideError, Result};
 use crate::partiql;
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 
@@ -36,8 +37,8 @@ pub struct ItemResponse {
     pub item: Option<Item>,
 }
 
-pub fn execute(
-    storage: &Storage,
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
     request: ExecuteTransactionRequest,
 ) -> Result<ExecuteTransactionResponse> {
     let statements = &request.transact_statements;
@@ -66,68 +67,50 @@ pub fn execute(
         parsed.push((ast, params));
     }
 
-    // Begin SQLite transaction
-    storage.begin_transaction()?;
+    // All statements run inside one SQLite transaction (all-or-nothing).
+    let responses =
+        helpers::with_write_transaction(storage, execute_within_transaction(storage, &parsed))
+            .await?;
 
-    let result = execute_within_transaction(storage, &parsed);
-
-    match result {
-        Ok(responses) => {
-            storage.commit()?;
-
-            // Build ConsumedCapacity if requested (simple estimate: 1 WCU per statement)
-            let consumed_capacity = if matches!(
-                request.return_consumed_capacity.as_deref(),
-                Some("TOTAL") | Some("INDEXES")
-            ) {
-                // Aggregate capacity by table name from parsed statements
-                let mut table_units: std::collections::HashMap<String, f64> =
-                    std::collections::HashMap::new();
-                for (stmt, _) in &parsed {
-                    if let Some(tbl) = partiql::parser::table_name(stmt) {
-                        *table_units.entry(tbl.to_string()).or_default() += 1.0;
-                    }
-                }
-                let caps: Vec<_> = table_units
-                    .iter()
-                    .filter_map(|(table, &units)| {
-                        crate::types::consumed_capacity(
-                            table,
-                            units,
-                            &request.return_consumed_capacity,
-                        )
-                    })
-                    .collect();
-                Some(caps)
-            } else {
-                None
-            };
-
-            Ok(ExecuteTransactionResponse {
-                responses: Some(responses),
-                consumed_capacity,
-            })
-        }
-        Err(e) => {
-            if let Err(rb_err) = storage.rollback() {
-                return Err(DynoxideError::InternalServerError(format!(
-                    "Transaction failed ({e}) and rollback also failed ({rb_err})"
-                )));
+    // Build ConsumedCapacity if requested (simple estimate: 1 WCU per statement)
+    let consumed_capacity = if matches!(
+        request.return_consumed_capacity.as_deref(),
+        Some("TOTAL") | Some("INDEXES")
+    ) {
+        // Aggregate capacity by table name from parsed statements
+        let mut table_units: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        for (stmt, _) in &parsed {
+            if let Some(tbl) = partiql::parser::table_name(stmt) {
+                *table_units.entry(tbl.to_string()).or_default() += 1.0;
             }
-            Err(e)
         }
-    }
+        let caps: Vec<_> = table_units
+            .iter()
+            .filter_map(|(table, &units)| {
+                crate::types::consumed_capacity(table, units, &request.return_consumed_capacity)
+            })
+            .collect();
+        Some(caps)
+    } else {
+        None
+    };
+
+    Ok(ExecuteTransactionResponse {
+        responses: Some(responses),
+        consumed_capacity,
+    })
 }
 
-fn execute_within_transaction(
-    storage: &Storage,
+async fn execute_within_transaction<S: StorageBackend>(
+    storage: &S,
     parsed: &[(partiql::parser::Statement, Vec<AttributeValue>)],
 ) -> Result<Vec<ItemResponse>> {
     let mut responses = Vec::with_capacity(parsed.len());
     let mut cancellation_reasons: Vec<CancellationReason> = Vec::with_capacity(parsed.len());
 
     for (stmt, params) in parsed {
-        match partiql::executor::execute(storage, stmt, params, None) {
+        match partiql::executor::execute(storage, stmt, params, None).await {
             Ok(result) => {
                 let item = result.and_then(|items| items.into_iter().next());
                 responses.push(ItemResponse { item });

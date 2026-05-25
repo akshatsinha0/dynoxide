@@ -247,7 +247,9 @@ async fn measure_docker_startup(
 
     // Forward LocalStack auth token if available
     let ls_token;
-    if image.contains("localstack") && let Ok(token) = std::env::var("LOCALSTACK_AUTH_TOKEN") {
+    if image.contains("localstack")
+        && let Ok(token) = std::env::var("LOCALSTACK_AUTH_TOKEN")
+    {
         ls_token = format!("LOCALSTACK_AUTH_TOKEN={token}");
         cmd_args.extend_from_slice(&["-e", &ls_token]);
     }

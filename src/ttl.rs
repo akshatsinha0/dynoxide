@@ -4,10 +4,9 @@
 
 use crate::actions::{gsi, lsi};
 use crate::errors::Result;
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::streams;
 use crate::types::{AttributeValue, Item};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// JSON representation of the TTL service identity for stream records.
 const TTL_USER_IDENTITY: &str = r#"{"type":"Service","principalId":"dynamodb.amazonaws.com"}"#;
@@ -15,13 +14,10 @@ const TTL_USER_IDENTITY: &str = r#"{"type":"Service","principalId":"dynamodb.ama
 /// Sweep all TTL-enabled tables and delete expired items.
 ///
 /// Returns the total number of items deleted across all tables.
-pub fn sweep_expired_items(storage: &Storage) -> Result<usize> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+pub async fn sweep_expired_items<S: StorageBackend>(storage: &S) -> Result<usize> {
+    let now = storage.clock().now_unix_secs();
 
-    let tables = storage.list_ttl_enabled_tables()?;
+    let tables = storage.list_ttl_enabled_tables().await?;
     let mut total_deleted = 0;
 
     for meta in &tables {
@@ -35,15 +31,17 @@ pub fn sweep_expired_items(storage: &Storage) -> Result<usize> {
         let mut exclusive_start_sk: Option<String> = None;
 
         loop {
-            let rows = storage.scan_items(
-                &meta.table_name,
-                &crate::storage::ScanParams {
-                    limit: Some(100),
-                    exclusive_start_pk: exclusive_start_pk.as_deref(),
-                    exclusive_start_sk: exclusive_start_sk.as_deref(),
-                    ..Default::default()
-                },
-            )?;
+            let rows = storage
+                .scan_items(
+                    &meta.table_name,
+                    &crate::storage::ScanParams {
+                        limit: Some(100),
+                        exclusive_start_pk: exclusive_start_pk.as_deref(),
+                        exclusive_start_sk: exclusive_start_sk.as_deref(),
+                        ..Default::default()
+                    },
+                )
+                .await?;
 
             if rows.is_empty() {
                 break;
@@ -56,22 +54,24 @@ pub fn sweep_expired_items(storage: &Storage) -> Result<usize> {
                 };
 
                 if is_expired(&item, &ttl_attr, now) {
-                    // Delete the item
-                    let old_json = storage.delete_item(&meta.table_name, pk, sk)?;
+                    // Each TTL deletion is atomic with its own index fan-out: a
+                    // mid-fan-out failure rolls that item's delete back rather
+                    // than leaving a torn index. Items are independent, so this
+                    // is one transaction per deleted item.
+                    crate::actions::helpers::with_write_transaction(storage, async {
+                        storage.delete_item(&meta.table_name, pk, sk).await?;
+                        gsi::maintain_gsis_after_delete(storage, &meta.table_name, meta, pk, sk)
+                            .await?;
+                        lsi::maintain_lsis_after_delete(storage, &meta.table_name, meta, pk, sk)
+                            .await?;
+                        // Generate stream REMOVE record with TTL service identity
+                        if meta.stream_enabled {
+                            record_ttl_stream_event(storage, meta, &item).await?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
 
-                    // Maintain GSI tables
-                    let _ =
-                        gsi::maintain_gsis_after_delete(storage, &meta.table_name, meta, pk, sk)?;
-
-                    // Maintain LSI tables
-                    lsi::maintain_lsis_after_delete(storage, &meta.table_name, meta, pk, sk)?;
-
-                    // Generate stream REMOVE record with TTL service identity
-                    if meta.stream_enabled {
-                        record_ttl_stream_event(storage, meta, &item)?;
-                    }
-
-                    let _ = old_json; // consumed by delete_item
                     total_deleted += 1;
                 }
             }
@@ -107,8 +107,8 @@ fn is_expired(item: &Item, ttl_attr: &str, now_epoch_secs: u64) -> bool {
 
 /// Record a stream REMOVE event for a TTL deletion, with the DynamoDB service
 /// user identity to distinguish from manual deletes.
-fn record_ttl_stream_event(
-    storage: &Storage,
+async fn record_ttl_stream_event<S: StorageBackend>(
+    storage: &S,
     meta: &crate::storage::TableMetadata,
     old_item: &Item,
 ) -> Result<()> {
@@ -127,24 +127,25 @@ fn record_ttl_stream_event(
         _ => None,
     };
 
-    let seq_num = storage.next_stream_sequence_number(&meta.table_name)?;
+    let seq_num = storage
+        .next_stream_sequence_number(&meta.table_name)
+        .await?;
     let sid = streams::shard_id(&meta.table_name);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = storage.clock().now_unix_secs() as i64;
 
-    storage.insert_stream_record_with_identity(
-        &meta.table_name,
-        "REMOVE",
-        &keys_json,
-        None,
-        old_image_json.as_deref(),
-        &seq_num.to_string(),
-        &sid,
-        now,
-        Some(TTL_USER_IDENTITY),
-    )?;
+    storage
+        .insert_stream_record_with_identity(
+            &meta.table_name,
+            "REMOVE",
+            &keys_json,
+            None,
+            old_image_json.as_deref(),
+            &seq_num.to_string(),
+            &sid,
+            now,
+            Some(TTL_USER_IDENTITY),
+        )
+        .await?;
 
     Ok(())
 }

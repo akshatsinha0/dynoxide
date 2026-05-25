@@ -1,6 +1,6 @@
 use crate::actions::helpers;
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{self, AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -108,7 +108,10 @@ pub struct GetItemResponse {
     pub consumed_capacity: Option<types::ConsumedCapacity>,
 }
 
-pub fn execute(storage: &Storage, request: GetItemRequest) -> Result<GetItemResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    request: GetItemRequest,
+) -> Result<GetItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
 
@@ -150,7 +153,7 @@ pub fn execute(storage: &Storage, request: GetItemRequest) -> Result<GetItemResp
         }
     }
 
-    let meta = helpers::require_table_for_item_op(storage, &request.table_name)?;
+    let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
 
     // Validate key has exactly the right attributes
@@ -161,7 +164,7 @@ pub fn execute(storage: &Storage, request: GetItemRequest) -> Result<GetItemResp
     let (pk, sk) = helpers::extract_key_strings(&request.key, &key_schema)?;
 
     // Fetch item
-    let item_json = storage.get_item(&request.table_name, &pk, &sk)?;
+    let item_json = storage.get_item(&request.table_name, &pk, &sk).await?;
     let item: Option<HashMap<String, AttributeValue>> =
         item_json.and_then(|json| serde_json::from_str::<Item>(&json).ok());
 

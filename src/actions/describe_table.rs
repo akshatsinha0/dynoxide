@@ -1,6 +1,6 @@
 use crate::actions::{TableDescription, build_table_description};
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use serde::{Deserialize, Serialize};
 
 /// Internal deserialization struct for detecting missing TableName.
@@ -58,12 +58,16 @@ pub struct DescribeTableResponse {
     pub table: TableDescription,
 }
 
-pub fn execute(storage: &Storage, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    request: DescribeTableRequest,
+) -> Result<DescribeTableResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
 
     let meta = storage
-        .get_table_metadata(&request.table_name)?
+        .get_table_metadata(&request.table_name)
+        .await?
         .ok_or_else(|| {
             DynoxideError::ResourceNotFoundException(format!(
                 "Requested resource not found: Table: {} not found",
@@ -72,7 +76,7 @@ pub fn execute(storage: &Storage, request: DescribeTableRequest) -> Result<Descr
         })?;
 
     // Get actual item count and size
-    let item_count = storage.count_items(&request.table_name).ok();
+    let item_count = storage.count_items(&request.table_name).await.ok();
     let table_size_bytes = item_count.map(|_| 0i64); // Approximate; real size tracking is deferred
 
     let desc = build_table_description(&meta, item_count, table_size_bytes);

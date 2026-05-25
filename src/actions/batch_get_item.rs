@@ -1,7 +1,7 @@
 use crate::actions::helpers;
 use crate::errors::{DynoxideError, Result};
 use crate::expressions;
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -38,7 +38,10 @@ pub struct BatchGetItemResponse {
     pub consumed_capacity: Option<Vec<crate::types::ConsumedCapacity>>,
 }
 
-pub fn execute(storage: &Storage, request: BatchGetItemRequest) -> Result<BatchGetItemResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    request: BatchGetItemRequest,
+) -> Result<BatchGetItemResponse> {
     // Validate RequestItems is not empty.
     // AWS routes the empty-map case through a separate parameter-required path
     // rather than the standard "N validation errors detected" envelope.
@@ -179,7 +182,7 @@ pub fn execute(storage: &Storage, request: BatchGetItemRequest) -> Result<BatchG
     let mut table_rcu: HashMap<String, f64> = HashMap::new();
 
     for (table_name, keys_and_attrs) in &request.request_items {
-        let meta = helpers::require_table_for_item_op(storage, table_name)?;
+        let meta = helpers::require_table_for_item_op(storage, table_name).await?;
         let key_schema = helpers::parse_key_schema(&meta)?;
 
         // Parse projection if present; also handle legacy AttributesToGet
@@ -220,7 +223,7 @@ pub fn execute(storage: &Storage, request: BatchGetItemRequest) -> Result<BatchG
             // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
             let (pk, sk) = helpers::extract_key_strings(key, &key_schema)?;
 
-            if let Some(item_json) = storage.get_item(table_name, &pk, &sk)? {
+            if let Some(item_json) = storage.get_item(table_name, &pk, &sk).await? {
                 let item: Item = serde_json::from_str(&item_json).map_err(|e| {
                     DynoxideError::InternalServerError(format!("Bad item JSON: {e}"))
                 })?;

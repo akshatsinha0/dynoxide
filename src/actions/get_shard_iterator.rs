@@ -1,5 +1,5 @@
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Deserialize)]
@@ -46,8 +46,8 @@ pub fn decode_shard_iterator(iterator: &str) -> Option<(String, String, i64)> {
     Some((data.table_name, data.shard_id, data.position))
 }
 
-pub fn execute(
-    storage: &Storage,
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
     request: GetShardIteratorRequest,
 ) -> Result<GetShardIteratorResponse> {
     // Parse table name from ARN
@@ -58,12 +58,15 @@ pub fn execute(
         ))
     })?;
 
-    let meta = storage.get_table_metadata(&table_name)?.ok_or_else(|| {
-        DynoxideError::ResourceNotFoundException(format!(
-            "Requested resource not found: Stream: {}",
-            request.stream_arn
-        ))
-    })?;
+    let meta = storage
+        .get_table_metadata(&table_name)
+        .await?
+        .ok_or_else(|| {
+            DynoxideError::ResourceNotFoundException(format!(
+                "Requested resource not found: Stream: {}",
+                request.stream_arn
+            ))
+        })?;
 
     if !meta.stream_enabled {
         return Err(DynoxideError::ResourceNotFoundException(format!(
@@ -76,7 +79,7 @@ pub fn execute(
         "TRIM_HORIZON" => 0,
         "LATEST" => {
             // Position at the latest record
-            let seq = storage.next_stream_sequence_number(&table_name)?;
+            let seq = storage.next_stream_sequence_number(&table_name).await?;
             seq - 1 // Will return records after this position
         }
         "AT_SEQUENCE_NUMBER" => {

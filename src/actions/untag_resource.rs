@@ -1,6 +1,6 @@
 use crate::actions::helpers;
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Deserialize)]
@@ -14,7 +14,10 @@ pub struct UntagResourceRequest {
 #[derive(Debug, Default, Serialize)]
 pub struct UntagResourceResponse {}
 
-pub fn execute(storage: &Storage, request: UntagResourceRequest) -> Result<UntagResourceResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    request: UntagResourceRequest,
+) -> Result<UntagResourceResponse> {
     let arn = request.resource_arn.as_deref().unwrap_or("");
     if arn.is_empty() {
         return Err(DynoxideError::ValidationException(
@@ -31,13 +34,13 @@ pub fn execute(storage: &Storage, request: UntagResourceRequest) -> Result<Untag
     }
 
     // Verify table exists
-    if !storage.table_exists(table_name)? {
+    if !storage.table_exists(table_name).await? {
         return Err(DynoxideError::ResourceNotFoundException(
             "Requested resource not found".to_string(),
         ));
     }
 
-    storage.remove_tags(table_name, &request.tag_keys)?;
+    storage.remove_tags(table_name, &request.tag_keys).await?;
 
     Ok(UntagResourceResponse {})
 }

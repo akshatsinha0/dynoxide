@@ -20,7 +20,12 @@ pub struct CancellationReason {
 ///
 /// Each variant corresponds to a DynamoDB API error, carrying a human-readable
 /// message that matches DynamoDB's actual error messages.
+///
+/// Marked `#[non_exhaustive]` as of 0.10.0 (itself a breaking release), so
+/// later variant additions stay non-breaking. Downstream `match` arms over
+/// this enum must include a wildcard.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DynoxideError {
     /// Table or resource not found.
     #[error("{0}")]
@@ -86,6 +91,31 @@ pub enum DynoxideError {
     /// SQLite error (converted from rusqlite).
     #[error("Internal error: {0}")]
     SqliteError(#[from] rusqlite::Error),
+}
+
+/// Most backend failures (`BackendError`) are storage-level faults: a locked
+/// database, an I/O error, a constraint the application layer did not
+/// anticipate. None of those is part of DynamoDB's client-facing error
+/// contract, so they surface as `InternalServerError` (HTTP 500), matching how
+/// a raw `rusqlite::Error` surfaces via `SqliteError`.
+///
+/// The one exception is `BackendError::Validation`: a backend method such as
+/// `set_tags` enforces a client-facing limit (the 50-tag cap) and raises a
+/// `ValidationException`. That crosses the trait boundary as
+/// `BackendError::Validation` and is restored here to its `ValidationException`
+/// (HTTP 400) so the envelope is unchanged from calling `Storage` directly.
+///
+/// A one-way `From` is deliberate rather than merging the two types:
+/// `BackendError` is the narrow storage vocabulary, `DynoxideError` the wider
+/// API vocabulary. A merge is deferred.
+impl From<crate::storage_backend::BackendError> for DynoxideError {
+    fn from(err: crate::storage_backend::BackendError) -> Self {
+        use crate::storage_backend::BackendError;
+        match err {
+            BackendError::Validation(msg) => DynoxideError::ValidationException(msg),
+            other => DynoxideError::InternalServerError(other.to_string()),
+        }
+    }
 }
 
 impl DynoxideError {
@@ -378,5 +408,14 @@ mod tests {
         // Uses capital Message (not lowercase)
         assert!(json.get("Message").is_some());
         assert!(json.get("message").is_none());
+    }
+
+    #[test]
+    fn test_backend_error_maps_to_internal() {
+        use crate::storage_backend::BackendError;
+        let err: DynoxideError = BackendError::Locked.into();
+        assert_eq!(err.status_code(), 500);
+        assert!(err.error_type().contains("InternalServerError"));
+        assert!(err.to_string().contains("locked"));
     }
 }

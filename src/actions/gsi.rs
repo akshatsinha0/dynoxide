@@ -3,7 +3,8 @@
 //! Handles keeping GSI tables in sync with base table writes.
 
 use crate::errors::{DynoxideError, Result};
-use crate::storage::{Storage, TableMetadata};
+use crate::storage::TableMetadata;
+use crate::storage_backend::StorageBackend;
 use crate::types::{GlobalSecondaryIndex, Item, KeyType, ProjectionType};
 use std::collections::HashMap;
 
@@ -123,8 +124,8 @@ pub fn build_index_item(
 /// Handles both insert and update cases.
 /// Returns a map of GSI name to write capacity units consumed.
 #[allow(clippy::too_many_arguments)]
-pub fn maintain_gsis_after_write(
-    storage: &Storage,
+pub async fn maintain_gsis_after_write<S: StorageBackend>(
+    storage: &S,
     table_name: &str,
     meta: &TableMetadata,
     table_pk_str: &str,
@@ -138,7 +139,9 @@ pub fn maintain_gsis_after_write(
 
     for gsi in &gsi_defs {
         // First, remove any existing GSI entry for this base table key
-        storage.delete_gsi_item(table_name, &gsi.index_name, table_pk_str, table_sk_str)?;
+        storage
+            .delete_gsi_item(table_name, &gsi.index_name, table_pk_str, table_sk_str)
+            .await?;
 
         // If the item has the GSI pk attribute, insert into GSI
         if let Some(gsi_pk_val) = item.get(&gsi.pk_attr) {
@@ -155,15 +158,17 @@ pub fn maintain_gsis_after_write(
             let item_json = serde_json::to_string(&projected)
                 .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
 
-            storage.insert_gsi_item(
-                table_name,
-                &gsi.index_name,
-                &gsi_pk,
-                &gsi_sk,
-                table_pk_str,
-                table_sk_str,
-                &item_json,
-            )?;
+            storage
+                .insert_gsi_item(
+                    table_name,
+                    &gsi.index_name,
+                    &gsi_pk,
+                    &gsi_sk,
+                    table_pk_str,
+                    table_sk_str,
+                    &item_json,
+                )
+                .await?;
 
             gsi_units.insert(
                 gsi.index_name.clone(),
@@ -177,8 +182,8 @@ pub fn maintain_gsis_after_write(
 
 /// Remove an item from all GSI tables after a delete.
 /// Returns a map of GSI name to write capacity units consumed.
-pub fn maintain_gsis_after_delete(
-    storage: &Storage,
+pub async fn maintain_gsis_after_delete<S: StorageBackend>(
+    storage: &S,
     table_name: &str,
     meta: &TableMetadata,
     table_pk_str: &str,
@@ -188,7 +193,9 @@ pub fn maintain_gsis_after_delete(
     let mut gsi_units: HashMap<String, f64> = HashMap::new();
 
     for gsi in &gsi_defs {
-        storage.delete_gsi_item(table_name, &gsi.index_name, table_pk_str, table_sk_str)?;
+        storage
+            .delete_gsi_item(table_name, &gsi.index_name, table_pk_str, table_sk_str)
+            .await?;
         // Delete operations consume 1 WCU minimum per GSI affected
         gsi_units.insert(gsi.index_name.clone(), 1.0);
     }

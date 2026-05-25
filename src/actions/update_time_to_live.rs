@@ -1,5 +1,5 @@
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Deserialize)]
@@ -24,8 +24,8 @@ pub struct UpdateTimeToLiveResponse {
     pub time_to_live_specification: TimeToLiveSpecification,
 }
 
-pub fn execute(
-    storage: &Storage,
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
     request: UpdateTimeToLiveRequest,
 ) -> Result<UpdateTimeToLiveResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
@@ -40,7 +40,8 @@ pub fn execute(
 
     // Verify table exists
     let meta = storage
-        .get_table_metadata(&request.table_name)?
+        .get_table_metadata(&request.table_name)
+        .await?
         .ok_or_else(|| {
             DynoxideError::ResourceNotFoundException(format!(
                 "Requested resource not found: Table: {} not found",
@@ -65,11 +66,13 @@ pub fn execute(
         None
     };
 
-    storage.update_ttl_config(
-        &request.table_name,
-        attr_name,
-        request.time_to_live_specification.enabled,
-    )?;
+    storage
+        .update_ttl_config(
+            &request.table_name,
+            attr_name,
+            request.time_to_live_specification.enabled,
+        )
+        .await?;
 
     Ok(UpdateTimeToLiveResponse {
         time_to_live_specification: request.time_to_live_specification,

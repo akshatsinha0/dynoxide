@@ -1,6 +1,6 @@
 use crate::actions::{TableDescription, build_table_description};
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{GlobalSecondaryIndex, LocalSecondaryIndex};
 use serde::{Deserialize, Serialize};
 
@@ -59,13 +59,17 @@ pub struct DeleteTableResponse {
     pub table_description: TableDescription,
 }
 
-pub fn execute(storage: &Storage, request: DeleteTableRequest) -> Result<DeleteTableResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    request: DeleteTableRequest,
+) -> Result<DeleteTableResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
 
     // Get metadata before deletion (for the response)
     let meta = storage
-        .get_table_metadata(&request.table_name)?
+        .get_table_metadata(&request.table_name)
+        .await?
         .ok_or_else(|| {
             DynoxideError::ResourceNotFoundException(format!(
                 "Requested resource not found: Table: {} not found",
@@ -85,7 +89,9 @@ pub fn execute(storage: &Storage, request: DeleteTableRequest) -> Result<DeleteT
     if let Some(ref gsi_json) = meta.gsi_definitions {
         if let Ok(gsis) = serde_json::from_str::<Vec<GlobalSecondaryIndex>>(gsi_json) {
             for gsi in &gsis {
-                storage.drop_gsi_table(&request.table_name, &gsi.index_name)?;
+                storage
+                    .drop_gsi_table(&request.table_name, &gsi.index_name)
+                    .await?;
             }
         }
     }
@@ -94,16 +100,18 @@ pub fn execute(storage: &Storage, request: DeleteTableRequest) -> Result<DeleteT
     if let Some(ref lsi_json) = meta.lsi_definitions {
         if let Ok(lsis) = serde_json::from_str::<Vec<LocalSecondaryIndex>>(lsi_json) {
             for lsi in &lsis {
-                storage.drop_lsi_table(&request.table_name, &lsi.index_name)?;
+                storage
+                    .drop_lsi_table(&request.table_name, &lsi.index_name)
+                    .await?;
             }
         }
     }
 
     // Drop data table
-    storage.drop_data_table(&request.table_name)?;
+    storage.drop_data_table(&request.table_name).await?;
 
     // Delete metadata
-    storage.delete_table_metadata(&request.table_name)?;
+    storage.delete_table_metadata(&request.table_name).await?;
 
     // Build response with DELETING status
     let mut desc = build_table_description(&meta, Some(0), Some(0));

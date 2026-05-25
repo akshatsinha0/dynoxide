@@ -1,5 +1,5 @@
 use crate::errors::Result;
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::validation;
 use serde::{Deserialize, Serialize};
 
@@ -95,10 +95,13 @@ pub struct ListTablesResponse {
     pub last_evaluated_table_name: Option<String>,
 }
 
-pub fn execute(storage: &Storage, request: ListTablesRequest) -> Result<ListTablesResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    request: ListTablesRequest,
+) -> Result<ListTablesResponse> {
     let limit = request.limit.unwrap_or(100).clamp(1, 100) as usize;
 
-    let all_tables = storage.list_table_names()?;
+    let all_tables = storage.list_table_names().await?;
 
     // Filter by ExclusiveStartTableName
     let filtered: Vec<String> = if let Some(ref start) = request.exclusive_start_table_name {

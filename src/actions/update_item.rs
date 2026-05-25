@@ -1,13 +1,12 @@
 use crate::actions::helpers;
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{self, AttributeValue};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Internal result from the transactional update work closure.
 struct UpdateWorkResult {
-    existing_json: Option<String>,
     old_item: HashMap<String, AttributeValue>,
     item: HashMap<String, AttributeValue>,
     item_json: String,
@@ -187,7 +186,10 @@ fn wrap_invalid_update_expression(err: String) -> String {
     }
 }
 
-pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<UpdateItemResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    mut request: UpdateItemRequest,
+) -> Result<UpdateItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
 
@@ -380,7 +382,7 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
         }
     }
 
-    let meta = helpers::require_table_for_item_op(storage, &request.table_name)?;
+    let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
 
     // Validate ReturnValues parameter
@@ -410,12 +412,6 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
         .as_ref()
         .map(|updates| updates.keys().cloned().collect());
 
-    // Wrap condition check + write in a transaction to prevent TOCTOU races
-    let has_condition = request.condition_expression.is_some();
-    if has_condition {
-        storage.begin_transaction()?;
-    }
-
     // Execution tracker — tracking disabled because unused-reference validation was
     // already done statically by Tracker 1 (pre-validation block above). This tracker
     // only needs name/value resolution, not usage tracking.
@@ -424,11 +420,22 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
         &request.expression_attribute_values,
     );
 
-    // Execute the condition check + update + write atomically within a transaction.
-    // The closure captures everything from get_item through put_item.
-    let transactional_work = || -> Result<UpdateWorkResult> {
+    // Wrap the condition check, base write and the GSI/LSI fan-out in a single
+    // transaction so a mid-fan-out failure rolls the whole update back, leaving
+    // no torn index. Unconditional because the atomicity guarantee applies to
+    // every single-item write. The block captures everything from get_item
+    // through the GSI/LSI fan-out and stream record.
+    let (
+        UpdateWorkResult {
+            old_item,
+            item,
+            item_json,
+            size,
+        },
+        gsi_units,
+    ) = helpers::with_write_transaction(storage, async {
         // Fetch existing item (or create empty one for upsert)
-        let existing_json = storage.get_item(&request.table_name, &pk, &sk)?;
+        let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
         let existing_item: HashMap<String, AttributeValue> = existing_json
             .as_ref()
             .and_then(|j| serde_json::from_str(j).ok())
@@ -547,75 +554,62 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
             .get(&key_schema.partition_key)
             .map(crate::storage::compute_hash_prefix)
             .unwrap_or_default();
-        storage.put_item_with_hash(
+        storage
+            .put_item_with_hash(
+                &request.table_name,
+                &pk,
+                &sk,
+                &item_json,
+                size,
+                &hash_prefix,
+            )
+            .await?;
+
+        // Maintain GSI tables (inside the transaction)
+        let gsi_units = super::gsi::maintain_gsis_after_write(
+            storage,
             &request.table_name,
+            &meta,
             &pk,
             &sk,
-            &item_json,
-            size,
-            &hash_prefix,
-        )?;
+            &item,
+            &key_schema.partition_key,
+            key_schema.sort_key.as_deref(),
+        )
+        .await?;
 
-        Ok(UpdateWorkResult {
-            existing_json,
-            old_item,
-            item,
-            item_json,
-            size,
-        })
-    };
+        // Maintain LSI tables (inside the transaction)
+        super::lsi::maintain_lsis_after_write(
+            storage,
+            &request.table_name,
+            &meta,
+            &pk,
+            &sk,
+            &item,
+            &key_schema.partition_key,
+            key_schema.sort_key.as_deref(),
+        )
+        .await?;
 
-    let result = transactional_work();
+        // Record stream event (inside the transaction)
+        let old_for_stream = if existing_json.is_some() {
+            Some(&old_item)
+        } else {
+            None
+        };
+        crate::streams::record_stream_event(storage, &meta, old_for_stream, Some(&item)).await?;
 
-    // Commit or rollback the condition+write transaction
-    if has_condition {
-        match result {
-            Ok(_) => storage.commit()?,
-            Err(ref _e) => {
-                let _ = storage.rollback();
-            }
-        }
-    }
-
-    let UpdateWorkResult {
-        existing_json,
-        old_item,
-        item,
-        item_json,
-        size,
-    } = result?;
-
-    // Maintain GSI tables
-    let gsi_units = super::gsi::maintain_gsis_after_write(
-        storage,
-        &request.table_name,
-        &meta,
-        &pk,
-        &sk,
-        &item,
-        &key_schema.partition_key,
-        key_schema.sort_key.as_deref(),
-    )?;
-
-    // Maintain LSI tables
-    super::lsi::maintain_lsis_after_write(
-        storage,
-        &request.table_name,
-        &meta,
-        &pk,
-        &sk,
-        &item,
-        &key_schema.partition_key,
-        key_schema.sort_key.as_deref(),
-    )?;
-
-    // Record stream event
-    let old_for_stream = if existing_json.is_some() {
-        Some(&old_item)
-    } else {
-        None
-    };
-    crate::streams::record_stream_event(storage, &meta, old_for_stream, Some(&item))?;
+        Ok((
+            UpdateWorkResult {
+                old_item,
+                item,
+                item_json,
+                size,
+            },
+            gsi_units,
+        ))
+    })
+    .await?;
 
     // Handle ReturnValues
     let return_values = request.return_values.as_deref().unwrap_or("NONE");
@@ -675,7 +669,8 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
             .as_ref()
             .unwrap_or(&AttributeValue::S(String::new())),
         &request.return_item_collection_metrics,
-    )?;
+    )
+    .await?;
 
     let consumed_capacity = types::consumed_capacity_with_indexes(
         &request.table_name,
@@ -858,4 +853,76 @@ fn validate_not_key_attr(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::actions::{create_table, put_item, update_item};
+    use crate::storage::Storage;
+    use crate::storage_backend::StorageBackend;
+
+    /// An update and its GSI fan-out succeed or fail as one unit: a mid-fan-out
+    /// failure leaves the item at its pre-update value.
+    #[test]
+    fn update_item_rolls_back_base_write_when_gsi_fan_out_fails() {
+        let storage = Storage::memory().unwrap();
+
+        let create = serde_json::from_value(serde_json::json!({
+            "TableName": "Orders",
+            "KeySchema": [{"AttributeName": "UserId", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "UserId", "AttributeType": "S"},
+                {"AttributeName": "Status", "AttributeType": "S"},
+                {"AttributeName": "Priority", "AttributeType": "S"}
+            ],
+            "GlobalSecondaryIndexes": [
+                {"IndexName": "StatusIndex", "KeySchema": [{"AttributeName": "Status", "KeyType": "HASH"}], "Projection": {"ProjectionType": "ALL"}},
+                {"IndexName": "PriorityIndex", "KeySchema": [{"AttributeName": "Priority", "KeyType": "HASH"}], "Projection": {"ProjectionType": "ALL"}}
+            ]
+        }))
+        .unwrap();
+        pollster::block_on(create_table::execute(&storage, create)).unwrap();
+
+        let put = serde_json::from_value(serde_json::json!({
+            "TableName": "Orders",
+            "Item": {"UserId": {"S": "u1"}, "Status": {"S": "SHIPPED"}, "Priority": {"S": "HIGH"}, "Note": {"S": "before"}}
+        }))
+        .unwrap();
+        pollster::block_on(put_item::execute(&storage, put)).unwrap();
+
+        // Break the second GSI's fan-out by dropping its physical table.
+        storage.drop_gsi_table("Orders", "PriorityIndex").unwrap();
+
+        let update = serde_json::from_value(serde_json::json!({
+            "TableName": "Orders",
+            "Key": {"UserId": {"S": "u1"}},
+            "UpdateExpression": "SET Note = :n",
+            "ExpressionAttributeValues": {":n": {"S": "after"}}
+        }))
+        .unwrap();
+        let res = pollster::block_on(update_item::execute(&storage, update));
+        assert!(
+            res.is_err(),
+            "a mid-fan-out failure must surface as an error"
+        );
+
+        // The base write must roll back: the item is still present at its
+        // pre-update value.
+        let rows = pollster::block_on(<Storage as StorageBackend>::scan_items(
+            &storage,
+            "Orders",
+            &Default::default(),
+        ))
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the item must still be present after rollback"
+        );
+        let raw = &rows[0].2;
+        assert!(
+            raw.contains("\"before\"") && !raw.contains("\"after\""),
+            "update must roll back when fan-out fails, leaving the original value: {raw}"
+        );
+    }
 }

@@ -1,6 +1,6 @@
 use crate::actions::helpers;
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{self, AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -48,8 +48,8 @@ pub struct BatchWriteItemResponse {
     pub item_collection_metrics: Option<HashMap<String, Vec<crate::types::ItemCollectionMetrics>>>,
 }
 
-pub fn execute(
-    storage: &Storage,
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
     mut request: BatchWriteItemRequest,
 ) -> Result<BatchWriteItemResponse> {
     const MAX_REQUEST_SIZE: usize = 16 * 1024 * 1024; // 16MB
@@ -156,7 +156,7 @@ pub fn execute(
         let mut seen_keys: std::collections::HashSet<(String, String, String)> =
             std::collections::HashSet::new();
         for (table_name, write_requests) in &request.request_items {
-            let meta = helpers::require_table_for_item_op(storage, table_name)?;
+            let meta = helpers::require_table_for_item_op(storage, table_name).await?;
             let key_schema = helpers::parse_key_schema(&meta)?;
             for wr in write_requests {
                 let key_item = if let Some(ref put) = wr.put_request {
@@ -192,7 +192,7 @@ pub fn execute(
     // level and pass pre-parsed defs into the maintenance functions.
 
     for (table_name, write_requests) in &mut request.request_items {
-        let meta = helpers::require_table_for_item_op(storage, table_name)?;
+        let meta = helpers::require_table_for_item_op(storage, table_name).await?;
         let key_schema = helpers::parse_key_schema(&meta)?;
 
         for wr in write_requests {
@@ -223,48 +223,58 @@ pub fn execute(
                     .get(&key_schema.partition_key)
                     .map(crate::storage::compute_hash_prefix)
                     .unwrap_or_default();
-                let old_json = storage.put_item_with_hash(
-                    table_name,
-                    &pk,
-                    &sk,
-                    &item_json,
-                    size,
-                    &hash_prefix,
-                )?;
+                // Base write + index fan-out + stream are one atomic unit per
+                // item: a mid-fan-out failure rolls this item's write back.
+                // BatchWriteItem items are independent, so this is one
+                // transaction per write request.
+                let gsi_units = helpers::with_write_transaction(storage, async {
+                    let old_json = storage
+                        .put_item_with_hash(table_name, &pk, &sk, &item_json, size, &hash_prefix)
+                        .await?;
+                    let gsi_units = super::gsi::maintain_gsis_after_write(
+                        storage,
+                        table_name,
+                        &meta,
+                        &pk,
+                        &sk,
+                        &put_req.item,
+                        &key_schema.partition_key,
+                        key_schema.sort_key.as_deref(),
+                    )
+                    .await?;
+                    super::lsi::maintain_lsis_after_write(
+                        storage,
+                        table_name,
+                        &meta,
+                        &pk,
+                        &sk,
+                        &put_req.item,
+                        &key_schema.partition_key,
+                        key_schema.sort_key.as_deref(),
+                    )
+                    .await?;
+                    let old_item: Option<Item> =
+                        old_json.and_then(|j| serde_json::from_str(&j).ok());
+                    crate::streams::record_stream_event(
+                        storage,
+                        &meta,
+                        old_item.as_ref(),
+                        Some(&put_req.item),
+                    )
+                    .await?;
+                    Ok(gsi_units)
+                })
+                .await?;
 
                 // Accumulate WCU based on item size
                 *table_wcu.entry(table_name.clone()).or_insert(0.0) +=
                     types::write_capacity_units(size);
-
-                // Maintain GSI tables
-                let gsi_units = super::gsi::maintain_gsis_after_write(
-                    storage,
-                    table_name,
-                    &meta,
-                    &pk,
-                    &sk,
-                    &put_req.item,
-                    &key_schema.partition_key,
-                    key_schema.sort_key.as_deref(),
-                )?;
 
                 // Accumulate GSI units per table
                 let table_entry = table_gsi_units.entry(table_name.clone()).or_default();
                 for (gsi_name, units) in &gsi_units {
                     *table_entry.entry(gsi_name.clone()).or_insert(0.0) += units;
                 }
-
-                // Maintain LSI tables
-                super::lsi::maintain_lsis_after_write(
-                    storage,
-                    table_name,
-                    &meta,
-                    &pk,
-                    &sk,
-                    &put_req.item,
-                    &key_schema.partition_key,
-                    key_schema.sort_key.as_deref(),
-                )?;
 
                 // Track affected partition for deferred metrics
                 if let Some(pk_val) = put_req.item.get(&key_schema.partition_key) {
@@ -275,24 +285,36 @@ pub fn execute(
                         pk_val.clone(),
                     ));
                 }
-
-                // Record stream event
-                let old_item: Option<Item> = old_json.and_then(|j| serde_json::from_str(&j).ok());
-                crate::streams::record_stream_event(
-                    storage,
-                    &meta,
-                    old_item.as_ref(),
-                    Some(&put_req.item),
-                )?;
             } else if let Some(ref del_req) = wr.delete_request {
                 helpers::validate_key_only(&del_req.key, &key_schema)?;
                 // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
                 let (pk, sk) = helpers::extract_key_strings(&del_req.key, &key_schema)?;
-                let old_json = storage.delete_item(table_name, &pk, &sk)?;
+
+                // Base delete + index fan-out + stream are one atomic unit per item.
+                let (old_item, gsi_units) = helpers::with_write_transaction(storage, async {
+                    let old_json = storage.delete_item(table_name, &pk, &sk).await?;
+                    let old_item: Option<Item> =
+                        old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
+                    let gsi_units = super::gsi::maintain_gsis_after_delete(
+                        storage, table_name, &meta, &pk, &sk,
+                    )
+                    .await?;
+                    super::lsi::maintain_lsis_after_delete(storage, table_name, &meta, &pk, &sk)
+                        .await?;
+                    if old_item.is_some() {
+                        crate::streams::record_stream_event(
+                            storage,
+                            &meta,
+                            old_item.as_ref(),
+                            None,
+                        )
+                        .await?;
+                    }
+                    Ok((old_item, gsi_units))
+                })
+                .await?;
 
                 // Accumulate WCU: based on old item size if it existed, else 1 WCU
-                let old_item: Option<Item> =
-                    old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
                 let delete_wcu = if let Some(ref old) = old_item {
                     types::write_capacity_units(types::item_size(old))
                 } else {
@@ -300,18 +322,11 @@ pub fn execute(
                 };
                 *table_wcu.entry(table_name.clone()).or_insert(0.0) += delete_wcu;
 
-                // Maintain GSI tables
-                let gsi_units =
-                    super::gsi::maintain_gsis_after_delete(storage, table_name, &meta, &pk, &sk)?;
-
                 // Accumulate GSI units per table
                 let table_entry = table_gsi_units.entry(table_name.clone()).or_default();
                 for (gsi_name, units) in &gsi_units {
                     *table_entry.entry(gsi_name.clone()).or_insert(0.0) += units;
                 }
-
-                // Maintain LSI tables
-                super::lsi::maintain_lsis_after_delete(storage, table_name, &meta, &pk, &sk)?;
 
                 // Track affected partition for deferred metrics
                 if let Some(pk_val) = del_req.key.get(&key_schema.partition_key) {
@@ -321,11 +336,6 @@ pub fn execute(
                         key_schema.partition_key.clone(),
                         pk_val.clone(),
                     ));
-                }
-
-                // Record stream event (old_item already parsed above)
-                if old_item.is_some() {
-                    crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None)?;
                 }
             } else {
                 return Err(DynoxideError::ValidationException(
@@ -372,7 +382,7 @@ pub fn execute(
             if !seen.insert(key) {
                 continue;
             }
-            let meta = helpers::require_table(storage, tbl)?;
+            let meta = helpers::require_table(storage, tbl).await?;
             if let Some(icm) = helpers::build_item_collection_metrics(
                 storage,
                 &meta,
@@ -381,7 +391,9 @@ pub fn execute(
                 pk_attr,
                 pk_val,
                 &request.return_item_collection_metrics,
-            )? {
+            )
+            .await?
+            {
                 all_item_collection_metrics
                     .entry(tbl.clone())
                     .or_default()
@@ -400,4 +412,60 @@ pub fn execute(
         consumed_capacity,
         item_collection_metrics,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::actions::{batch_write_item, create_table};
+    use crate::storage::Storage;
+    use crate::storage_backend::StorageBackend;
+
+    /// Each batch put is atomic with its own GSI fan-out: a mid-fan-out failure
+    /// rolls that item's base write back rather than leaving a torn index.
+    #[test]
+    fn batch_put_rolls_back_base_write_when_gsi_fan_out_fails() {
+        let storage = Storage::memory().unwrap();
+
+        let create = serde_json::from_value(serde_json::json!({
+            "TableName": "Orders",
+            "KeySchema": [{"AttributeName": "UserId", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "UserId", "AttributeType": "S"},
+                {"AttributeName": "Status", "AttributeType": "S"},
+                {"AttributeName": "Priority", "AttributeType": "S"}
+            ],
+            "GlobalSecondaryIndexes": [
+                {"IndexName": "StatusIndex", "KeySchema": [{"AttributeName": "Status", "KeyType": "HASH"}], "Projection": {"ProjectionType": "ALL"}},
+                {"IndexName": "PriorityIndex", "KeySchema": [{"AttributeName": "Priority", "KeyType": "HASH"}], "Projection": {"ProjectionType": "ALL"}}
+            ]
+        }))
+        .unwrap();
+        pollster::block_on(create_table::execute(&storage, create)).unwrap();
+
+        // Break the second GSI's fan-out by dropping its physical table.
+        storage.drop_gsi_table("Orders", "PriorityIndex").unwrap();
+
+        let batch = serde_json::from_value(serde_json::json!({
+            "RequestItems": {
+                "Orders": [
+                    {"PutRequest": {"Item": {"UserId": {"S": "u1"}, "Status": {"S": "SHIPPED"}, "Priority": {"S": "HIGH"}}}}
+                ]
+            }
+        }))
+        .unwrap();
+        let res = pollster::block_on(batch_write_item::execute(&storage, batch));
+        assert!(
+            res.is_err(),
+            "a mid-fan-out failure must surface as an error"
+        );
+
+        // The base write must roll back: no item landed.
+        let count =
+            pollster::block_on(<Storage as StorageBackend>::count_items(&storage, "Orders"))
+                .unwrap();
+        assert_eq!(
+            count, 0,
+            "batch put base write must roll back when fan-out fails"
+        );
+    }
 }

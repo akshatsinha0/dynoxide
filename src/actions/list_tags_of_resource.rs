@@ -1,6 +1,6 @@
 use crate::actions::helpers;
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::Tag;
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +16,8 @@ pub struct ListTagsOfResourceResponse {
     pub tags: Vec<Tag>,
 }
 
-pub fn execute(
-    storage: &Storage,
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
     request: ListTagsOfResourceRequest,
 ) -> Result<ListTagsOfResourceResponse> {
     let arn = request.resource_arn.as_deref().unwrap_or("");
@@ -29,13 +29,13 @@ pub fn execute(
     let table_name = helpers::parse_table_name_from_arn(arn)?;
 
     // Verify table exists — real DynamoDB returns AccessDeniedException for non-existent ARNs
-    if !storage.table_exists(table_name)? {
+    if !storage.table_exists(table_name).await? {
         return Err(DynoxideError::AccessDeniedException(format!(
             "User: arn:aws:iam::000000000000:root is not authorized to perform: dynamodb:ListTagsOfResource on resource: {arn}"
         )));
     }
 
-    let tags = storage.get_tags(table_name)?;
+    let tags = storage.get_tags(table_name).await?;
 
     Ok(ListTagsOfResourceResponse { tags })
 }
