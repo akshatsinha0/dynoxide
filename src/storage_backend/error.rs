@@ -32,6 +32,13 @@ pub enum BackendError {
     #[error("backend: I/O error: {0}")]
     Io(String),
 
+    /// A client-facing validation failure raised by a backend method (for
+    /// example the tag-count limit in `set_tags`). Carries the original
+    /// message so `From<BackendError> for DynoxideError` can restore it as a
+    /// `ValidationException` rather than collapsing it to a 500.
+    #[error("{0}")]
+    Validation(String),
+
     /// Any other backend failure. Carries the original error's `Display` output.
     #[error("backend: {0}")]
     Other(String),

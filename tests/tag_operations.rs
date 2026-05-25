@@ -1,4 +1,5 @@
 use dynoxide::Database;
+use dynoxide::DynoxideError;
 use dynoxide::actions::create_table::CreateTableRequest;
 use dynoxide::actions::list_tags_of_resource::ListTagsOfResourceRequest;
 use dynoxide::actions::tag_resource::TagResourceRequest;
@@ -188,6 +189,11 @@ fn test_tag_resource_max_50() {
         })
         .unwrap_err();
     assert!(err.to_string().contains("tag limit is 50"));
+    // The tag-limit breach is a client-facing ValidationException (HTTP 400),
+    // not a 500. set_tags raises it inside the backend, so it must survive the
+    // StorageBackend trait boundary rather than collapsing to InternalServerError.
+    assert_eq!(err.status_code(), 400);
+    assert!(matches!(err, DynoxideError::ValidationException(_)));
 }
 
 #[test]

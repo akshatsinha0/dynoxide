@@ -88,21 +88,28 @@ pub enum DynoxideError {
     SqliteError(#[from] rusqlite::Error),
 }
 
-/// Backend-layer failures (`BackendError`) are storage-level faults: a locked
+/// Most backend failures (`BackendError`) are storage-level faults: a locked
 /// database, an I/O error, a constraint the application layer did not
-/// anticipate. None of them is part of DynamoDB's client-facing error contract,
-/// so they all surface as `InternalServerError` (HTTP 500), matching how a raw
-/// `rusqlite::Error` surfaces today via `SqliteError`. Client-facing failures
-/// (conditional checks, validation) never travel through `BackendError`; the
-/// handlers construct those `DynoxideError` variants directly, so this
-/// conversion is not lossy on the native path.
+/// anticipate. None of those is part of DynamoDB's client-facing error
+/// contract, so they surface as `InternalServerError` (HTTP 500), matching how
+/// a raw `rusqlite::Error` surfaces via `SqliteError`.
+///
+/// The one exception is `BackendError::Validation`: a backend method such as
+/// `set_tags` enforces a client-facing limit (the 50-tag cap) and raises a
+/// `ValidationException`. That crosses the trait boundary as
+/// `BackendError::Validation` and is restored here to its `ValidationException`
+/// (HTTP 400) so the envelope is unchanged from calling `Storage` directly.
 ///
 /// A one-way `From` is deliberate rather than merging the two types:
 /// `BackendError` is the narrow storage vocabulary, `DynoxideError` the wider
 /// API vocabulary. A merge is deferred.
 impl From<crate::storage_backend::BackendError> for DynoxideError {
     fn from(err: crate::storage_backend::BackendError) -> Self {
-        DynoxideError::InternalServerError(err.to_string())
+        use crate::storage_backend::BackendError;
+        match err {
+            BackendError::Validation(msg) => DynoxideError::ValidationException(msg),
+            other => DynoxideError::InternalServerError(other.to_string()),
+        }
     }
 }
 

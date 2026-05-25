@@ -18,12 +18,15 @@ use crate::types::Tag;
 ///
 /// Storage's sync surface returns `Result<T, DynoxideError>`; the trait surface
 /// returns `Result<T, BackendError>`. The conversion preserves rusqlite error
-/// codes via [`error::from_rusqlite`] and falls through any other variant
-/// (`InternalServerError`, `ValidationException`, etc.) into
+/// codes via [`error::from_rusqlite`]. A client-facing `ValidationException`
+/// (a backend method such as `set_tags` enforces the tag-count limit) is
+/// preserved as [`BackendError::Validation`] so the reverse conversion can
+/// restore its 400 envelope; any other variant falls through to
 /// [`BackendError::Other`] carrying the original `Display` output.
 fn dyno_to_backend(err: DynoxideError) -> BackendError {
     match err {
         DynoxideError::SqliteError(e) => error::from_rusqlite(e),
+        DynoxideError::ValidationException(msg) => BackendError::Validation(msg),
         other => BackendError::Other(other.to_string()),
     }
 }
