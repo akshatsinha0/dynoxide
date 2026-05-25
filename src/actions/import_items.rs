@@ -272,3 +272,61 @@ async fn execute_inner<S: StorageBackend>(
         bytes_imported: total_bytes,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::ImportOptions;
+    use crate::actions::create_table;
+    use crate::storage::Storage;
+    use crate::storage_backend::StorageBackend;
+
+    /// A failed import rolls the whole batch back: GSI entries written before
+    /// the failure (and any base rows) are undone, leaving the table empty.
+    #[test]
+    fn import_rolls_back_when_gsi_fan_out_fails() {
+        let storage = Storage::memory().unwrap();
+
+        let create = serde_json::from_value(serde_json::json!({
+            "TableName": "Orders",
+            "KeySchema": [{"AttributeName": "UserId", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "UserId", "AttributeType": "S"},
+                {"AttributeName": "Status", "AttributeType": "S"}
+            ],
+            "GlobalSecondaryIndexes": [
+                {"IndexName": "StatusIndex", "KeySchema": [{"AttributeName": "Status", "KeyType": "HASH"}], "Projection": {"ProjectionType": "ALL"}}
+            ]
+        }))
+        .unwrap();
+        pollster::block_on(create_table::execute(&storage, create)).unwrap();
+
+        // Break the GSI fan-out by dropping its physical table.
+        storage.drop_gsi_table("Orders", "StatusIndex").unwrap();
+
+        let items: Vec<crate::types::Item> = vec![
+            serde_json::from_value(
+                serde_json::json!({"UserId": {"S": "u1"}, "Status": {"S": "SHIPPED"}}),
+            )
+            .unwrap(),
+        ];
+        let res = pollster::block_on(super::execute(
+            &storage,
+            "Orders",
+            items,
+            &ImportOptions::default(),
+        ));
+        assert!(
+            res.is_err(),
+            "a mid-fan-out failure must surface as an error"
+        );
+
+        // The whole import rolled back: no base rows landed.
+        let count =
+            pollster::block_on(<Storage as StorageBackend>::count_items(&storage, "Orders"))
+                .unwrap();
+        assert_eq!(
+            count, 0,
+            "import must roll back entirely when fan-out fails"
+        );
+    }
+}
