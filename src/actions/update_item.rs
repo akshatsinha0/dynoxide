@@ -7,7 +7,6 @@ use std::collections::HashMap;
 
 /// Internal result from the transactional update work closure.
 struct UpdateWorkResult {
-    existing_json: Option<String>,
     old_item: HashMap<String, AttributeValue>,
     item: HashMap<String, AttributeValue>,
     item_json: String,
@@ -405,11 +404,11 @@ pub async fn execute<S: StorageBackend>(
         .as_ref()
         .map(|updates| updates.keys().cloned().collect());
 
-    // Wrap condition check + write in a transaction to prevent TOCTOU races
-    let has_condition = request.condition_expression.is_some();
-    if has_condition {
-        storage.begin_transaction().await?;
-    }
+    // Wrap the condition check, base write and the GSI/LSI fan-out in a single
+    // transaction so a mid-fan-out failure rolls the whole update back, leaving
+    // no torn index. Unconditional because the atomicity guarantee applies to
+    // every single-item write.
+    storage.begin_transaction().await?;
 
     // Execution tracker — tracking disabled because unused-reference validation was
     // already done statically by Tracker 1 (pre-validation block above). This tracker
@@ -419,9 +418,10 @@ pub async fn execute<S: StorageBackend>(
         &request.expression_attribute_values,
     );
 
-    // Execute the condition check + update + write atomically within a transaction.
-    // The block captures everything from get_item through put_item.
-    let result: Result<UpdateWorkResult> = async {
+    // Execute the condition check + update + write + index fan-out atomically
+    // within the transaction. The block captures everything from get_item
+    // through the GSI/LSI fan-out and stream record.
+    let result: Result<(UpdateWorkResult, HashMap<String, f64>)> = async {
         // Fetch existing item (or create empty one for upsert)
         let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
         let existing_item: HashMap<String, AttributeValue> = existing_json
@@ -553,67 +553,69 @@ pub async fn execute<S: StorageBackend>(
             )
             .await?;
 
-        Ok(UpdateWorkResult {
-            existing_json,
+        // Maintain GSI tables (inside the transaction)
+        let gsi_units = super::gsi::maintain_gsis_after_write(
+            storage,
+            &request.table_name,
+            &meta,
+            &pk,
+            &sk,
+            &item,
+            &key_schema.partition_key,
+            key_schema.sort_key.as_deref(),
+        )
+        .await?;
+
+        // Maintain LSI tables (inside the transaction)
+        super::lsi::maintain_lsis_after_write(
+            storage,
+            &request.table_name,
+            &meta,
+            &pk,
+            &sk,
+            &item,
+            &key_schema.partition_key,
+            key_schema.sort_key.as_deref(),
+        )
+        .await?;
+
+        // Record stream event (inside the transaction)
+        let old_for_stream = if existing_json.is_some() {
+            Some(&old_item)
+        } else {
+            None
+        };
+        crate::streams::record_stream_event(storage, &meta, old_for_stream, Some(&item)).await?;
+
+        Ok((
+            UpdateWorkResult {
+                old_item,
+                item,
+                item_json,
+                size,
+            },
+            gsi_units,
+        ))
+    }
+    .await;
+
+    // Commit on success, roll back the whole update on any failure.
+    match result {
+        Ok(_) => storage.commit().await?,
+        Err(ref _e) => {
+            let _ = storage.rollback().await;
+        }
+    }
+
+    let (
+        UpdateWorkResult {
             old_item,
             item,
             item_json,
             size,
-        })
-    }
-    .await;
-
-    // Commit or rollback the condition+write transaction
-    if has_condition {
-        match result {
-            Ok(_) => storage.commit().await?,
-            Err(ref _e) => {
-                let _ = storage.rollback().await;
-            }
-        }
-    }
-
-    let UpdateWorkResult {
-        existing_json,
-        old_item,
-        item,
-        item_json,
-        size,
-    } = result?;
-
-    // Maintain GSI tables
-    let gsi_units = super::gsi::maintain_gsis_after_write(
-        storage,
-        &request.table_name,
-        &meta,
-        &pk,
-        &sk,
-        &item,
-        &key_schema.partition_key,
-        key_schema.sort_key.as_deref(),
-    )
-    .await?;
-
-    // Maintain LSI tables
-    super::lsi::maintain_lsis_after_write(
-        storage,
-        &request.table_name,
-        &meta,
-        &pk,
-        &sk,
-        &item,
-        &key_schema.partition_key,
-        key_schema.sort_key.as_deref(),
-    )
-    .await?;
-
-    // Record stream event
-    let old_for_stream = if existing_json.is_some() {
-        Some(&old_item)
-    } else {
-        None
-    };
-    crate::streams::record_stream_event(storage, &meta, old_for_stream, Some(&item)).await?;
+        },
+        gsi_units,
+    ) = result?;
 
     // Handle ReturnValues
     let return_values = request.return_values.as_deref().unwrap_or("NONE");
