@@ -356,10 +356,8 @@ pub async fn execute<S: StorageBackend>(
     let is_increase = new_rcu > cur_rcu || new_wcu > cur_wcu;
     let is_decrease = new_rcu < cur_rcu || new_wcu < cur_wcu;
 
-    // All validation passed — perform mutations inside a transaction
-    storage.begin_transaction().await?;
-
-    let result: Result<()> = async {
+    // All validation passed; perform mutations inside a single transaction.
+    helpers::with_write_transaction(storage, async {
         if let Some(ref updates) = request.global_secondary_index_updates {
             for update in updates {
                 if let Some(ref create) = update.create {
@@ -470,16 +468,8 @@ pub async fn execute<S: StorageBackend>(
         }
 
         Ok(())
-    }
-    .await;
-
-    match result {
-        Ok(()) => storage.commit().await?,
-        Err(e) => {
-            let _ = storage.rollback().await;
-            return Err(e);
-        }
-    }
+    })
+    .await?;
 
     // Build response from updated metadata
     let updated_meta = helpers::require_table(storage, &request.table_name).await?;

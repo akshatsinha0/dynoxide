@@ -404,12 +404,6 @@ pub async fn execute<S: StorageBackend>(
         .as_ref()
         .map(|updates| updates.keys().cloned().collect());
 
-    // Wrap the condition check, base write and the GSI/LSI fan-out in a single
-    // transaction so a mid-fan-out failure rolls the whole update back, leaving
-    // no torn index. Unconditional because the atomicity guarantee applies to
-    // every single-item write.
-    storage.begin_transaction().await?;
-
     // Execution tracker — tracking disabled because unused-reference validation was
     // already done statically by Tracker 1 (pre-validation block above). This tracker
     // only needs name/value resolution, not usage tracking.
@@ -418,10 +412,20 @@ pub async fn execute<S: StorageBackend>(
         &request.expression_attribute_values,
     );
 
-    // Execute the condition check + update + write + index fan-out atomically
-    // within the transaction. The block captures everything from get_item
+    // Wrap the condition check, base write and the GSI/LSI fan-out in a single
+    // transaction so a mid-fan-out failure rolls the whole update back, leaving
+    // no torn index. Unconditional because the atomicity guarantee applies to
+    // every single-item write. The block captures everything from get_item
     // through the GSI/LSI fan-out and stream record.
-    let result: Result<(UpdateWorkResult, HashMap<String, f64>)> = async {
+    let (
+        UpdateWorkResult {
+            old_item,
+            item,
+            item_json,
+            size,
+        },
+        gsi_units,
+    ) = helpers::with_write_transaction(storage, async {
         // Fetch existing item (or create empty one for upsert)
         let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
         let existing_item: HashMap<String, AttributeValue> = existing_json
@@ -596,26 +600,8 @@ pub async fn execute<S: StorageBackend>(
             },
             gsi_units,
         ))
-    }
-    .await;
-
-    // Commit on success, roll back the whole update on any failure.
-    match result {
-        Ok(_) => storage.commit().await?,
-        Err(ref _e) => {
-            let _ = storage.rollback().await;
-        }
-    }
-
-    let (
-        UpdateWorkResult {
-            old_item,
-            item,
-            item_json,
-            size,
-        },
-        gsi_units,
-    ) = result?;
+    })
+    .await?;
 
     // Handle ReturnValues
     let return_values = request.return_values.as_deref().unwrap_or("NONE");

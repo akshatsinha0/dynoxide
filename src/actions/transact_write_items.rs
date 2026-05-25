@@ -152,52 +152,37 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
-    // Begin SQLite transaction
-    storage.begin_transaction().await?;
+    // All actions run inside one SQLite transaction (all-or-nothing).
+    helpers::with_write_transaction(storage, execute_within_transaction(storage, items)).await?;
 
-    let result = execute_within_transaction(storage, items).await;
-
-    match result {
-        Ok(()) => {
-            storage.commit().await?;
-            // Build consumed capacity per table
-            let consumed_capacity = if matches!(
-                request.return_consumed_capacity.as_deref(),
-                Some("TOTAL") | Some("INDEXES")
-            ) {
-                let mut table_sizes: HashMap<String, usize> = HashMap::new();
-                for item in items {
-                    let (table, size) = get_action_table_and_size(item);
-                    *table_sizes.entry(table).or_default() += size;
-                }
-                let caps: Vec<_> = table_sizes
-                    .iter()
-                    .filter_map(|(table, &size)| {
-                        crate::types::consumed_capacity(
-                            table,
-                            crate::types::write_capacity_units(size),
-                            &request.return_consumed_capacity,
-                        )
-                    })
-                    .collect();
-                Some(caps)
-            } else {
-                None
-            };
-            Ok(TransactWriteItemsResponse {
-                consumed_capacity,
-                item_collection_metrics: None,
+    // Build consumed capacity per table
+    let consumed_capacity = if matches!(
+        request.return_consumed_capacity.as_deref(),
+        Some("TOTAL") | Some("INDEXES")
+    ) {
+        let mut table_sizes: HashMap<String, usize> = HashMap::new();
+        for item in items {
+            let (table, size) = get_action_table_and_size(item);
+            *table_sizes.entry(table).or_default() += size;
+        }
+        let caps: Vec<_> = table_sizes
+            .iter()
+            .filter_map(|(table, &size)| {
+                crate::types::consumed_capacity(
+                    table,
+                    crate::types::write_capacity_units(size),
+                    &request.return_consumed_capacity,
+                )
             })
-        }
-        Err(e) => {
-            if let Err(rb_err) = storage.rollback().await {
-                return Err(DynoxideError::InternalServerError(format!(
-                    "Transaction failed ({e}) and rollback also failed ({rb_err})"
-                )));
-            }
-            Err(e)
-        }
-    }
+            .collect();
+        Some(caps)
+    } else {
+        None
+    };
+    Ok(TransactWriteItemsResponse {
+        consumed_capacity,
+        item_collection_metrics: None,
+    })
 }
 
 async fn execute_within_transaction<S: StorageBackend>(

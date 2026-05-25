@@ -280,9 +280,7 @@ pub async fn execute<S: StorageBackend>(
     // transaction so a mid-fan-out failure rolls the whole delete back, leaving
     // no torn index. Unconditional (not just for ConditionExpression) because
     // the atomicity guarantee applies to every single-item write.
-    storage.begin_transaction().await?;
-
-    let write_result: Result<(Option<String>, HashMap<String, f64>)> = async {
+    let (old_item, gsi_units) = helpers::with_write_transaction(storage, async {
         // Evaluate ConditionExpression against existing item
         if let Some(ref cond_expr) = request.condition_expression {
             let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
@@ -326,29 +324,17 @@ pub async fn execute<S: StorageBackend>(
         super::lsi::maintain_lsis_after_delete(storage, &request.table_name, &meta, &pk, &sk)
             .await?;
 
+        // Parse the old item once, here, for the stream record and the response.
+        let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
+
         // Record stream event (inside the transaction)
-        let old_item_for_stream: Option<Item> =
-            old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
-        if old_item_for_stream.is_some() {
-            crate::streams::record_stream_event(storage, &meta, old_item_for_stream.as_ref(), None)
-                .await?;
+        if old_item.is_some() {
+            crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None).await?;
         }
 
-        Ok((old_json, gsi_units))
-    }
-    .await;
-
-    // Commit on success, roll back the whole delete on any failure.
-    match write_result {
-        Ok(_) => storage.commit().await?,
-        Err(ref _e) => {
-            let _ = storage.rollback().await;
-        }
-    }
-
-    let (old_json, gsi_units) = write_result?;
-    let old_item_for_stream: Option<Item> =
-        old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
+        Ok((old_item, gsi_units))
+    })
+    .await?;
 
     // Handle ReturnValues
     let return_old = request
@@ -357,11 +343,7 @@ pub async fn execute<S: StorageBackend>(
         .unwrap_or("NONE")
         .eq_ignore_ascii_case("ALL_OLD");
 
-    let attributes = if return_old {
-        old_json.and_then(|json| serde_json::from_str::<Item>(&json).ok())
-    } else {
-        None
-    };
+    let attributes = if return_old { old_item.clone() } else { None };
 
     // Build item collection metrics (only for tables with LSIs)
     let pk_value = request.key.get(&key_schema.partition_key).cloned();
@@ -379,10 +361,7 @@ pub async fn execute<S: StorageBackend>(
     .await?;
 
     // Calculate consumed capacity from old item size (write for delete)
-    let old_size = old_item_for_stream
-        .as_ref()
-        .map(types::item_size)
-        .unwrap_or(0);
+    let old_size = old_item.as_ref().map(types::item_size).unwrap_or(0);
     let consumed_capacity = types::consumed_capacity_with_indexes(
         &request.table_name,
         types::write_capacity_units(old_size),

@@ -1,3 +1,4 @@
+use crate::actions::helpers;
 use crate::errors::{CancellationReason, DynoxideError, Result};
 use crate::partiql;
 use crate::storage_backend::StorageBackend;
@@ -66,57 +67,39 @@ pub async fn execute<S: StorageBackend>(
         parsed.push((ast, params));
     }
 
-    // Begin SQLite transaction
-    storage.begin_transaction().await?;
+    // All statements run inside one SQLite transaction (all-or-nothing).
+    let responses =
+        helpers::with_write_transaction(storage, execute_within_transaction(storage, &parsed))
+            .await?;
 
-    let result = execute_within_transaction(storage, &parsed).await;
-
-    match result {
-        Ok(responses) => {
-            storage.commit().await?;
-
-            // Build ConsumedCapacity if requested (simple estimate: 1 WCU per statement)
-            let consumed_capacity = if matches!(
-                request.return_consumed_capacity.as_deref(),
-                Some("TOTAL") | Some("INDEXES")
-            ) {
-                // Aggregate capacity by table name from parsed statements
-                let mut table_units: std::collections::HashMap<String, f64> =
-                    std::collections::HashMap::new();
-                for (stmt, _) in &parsed {
-                    if let Some(tbl) = partiql::parser::table_name(stmt) {
-                        *table_units.entry(tbl.to_string()).or_default() += 1.0;
-                    }
-                }
-                let caps: Vec<_> = table_units
-                    .iter()
-                    .filter_map(|(table, &units)| {
-                        crate::types::consumed_capacity(
-                            table,
-                            units,
-                            &request.return_consumed_capacity,
-                        )
-                    })
-                    .collect();
-                Some(caps)
-            } else {
-                None
-            };
-
-            Ok(ExecuteTransactionResponse {
-                responses: Some(responses),
-                consumed_capacity,
-            })
-        }
-        Err(e) => {
-            if let Err(rb_err) = storage.rollback().await {
-                return Err(DynoxideError::InternalServerError(format!(
-                    "Transaction failed ({e}) and rollback also failed ({rb_err})"
-                )));
+    // Build ConsumedCapacity if requested (simple estimate: 1 WCU per statement)
+    let consumed_capacity = if matches!(
+        request.return_consumed_capacity.as_deref(),
+        Some("TOTAL") | Some("INDEXES")
+    ) {
+        // Aggregate capacity by table name from parsed statements
+        let mut table_units: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        for (stmt, _) in &parsed {
+            if let Some(tbl) = partiql::parser::table_name(stmt) {
+                *table_units.entry(tbl.to_string()).or_default() += 1.0;
             }
-            Err(e)
         }
-    }
+        let caps: Vec<_> = table_units
+            .iter()
+            .filter_map(|(table, &units)| {
+                crate::types::consumed_capacity(table, units, &request.return_consumed_capacity)
+            })
+            .collect();
+        Some(caps)
+    } else {
+        None
+    };
+
+    Ok(ExecuteTransactionResponse {
+        responses: Some(responses),
+        consumed_capacity,
+    })
 }
 
 async fn execute_within_transaction<S: StorageBackend>(

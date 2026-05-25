@@ -5,6 +5,47 @@ use crate::types::{
     AttributeDefinition, AttributeValue, KeySchemaElement, KeyType, ScalarAttributeType,
 };
 use std::collections::HashMap;
+use std::future::Future;
+
+/// Run `body` inside a single backend write transaction.
+///
+/// Commits on success; if the commit itself fails, rolls back and surfaces the
+/// failure rather than leaving the connection stuck mid-transaction (a leftover
+/// open transaction makes the next `begin_transaction` fail). On any error from
+/// `body`, rolls back; if that rollback also fails, surfaces a combined error.
+///
+/// This is the single place the write-transaction lifecycle policy lives, so
+/// every write path handles a failed commit or rollback identically.
+pub async fn with_write_transaction<S, T, F>(storage: &S, body: F) -> Result<T>
+where
+    S: StorageBackend,
+    F: Future<Output = Result<T>>,
+{
+    storage.begin_transaction().await?;
+    match body.await {
+        Ok(value) => match storage.commit().await {
+            Ok(()) => Ok(value),
+            Err(commit_err) => {
+                if let Err(rb_err) = storage.rollback().await {
+                    Err(DynoxideError::InternalServerError(format!(
+                        "commit failed ({commit_err}) and rollback also failed ({rb_err})"
+                    )))
+                } else {
+                    Err(commit_err.into())
+                }
+            }
+        },
+        Err(e) => {
+            if let Err(rb_err) = storage.rollback().await {
+                Err(DynoxideError::InternalServerError(format!(
+                    "operation failed ({e}) and rollback also failed ({rb_err})"
+                )))
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
 
 /// Parsed key schema for convenient access.
 pub struct KeySchema {

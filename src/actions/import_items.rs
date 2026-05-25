@@ -59,9 +59,6 @@ async fn execute_inner<S: StorageBackend>(
     let gsi_defs = gsi::parse_gsi_defs(&meta)?;
     let lsi_defs = lsi::parse_lsi_defs(&meta)?;
 
-    // 4. Begin transaction
-    storage.begin_transaction().await?;
-
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
@@ -72,17 +69,22 @@ async fn execute_inner<S: StorageBackend>(
         None
     };
 
-    // Pre-fetch the next stream sequence number once (fix: O(n) → O(1))
-    let mut next_seq = if options.record_streams && meta.stream_enabled {
-        storage.next_stream_sequence_number(table_name).await?
-    } else {
-        0
-    };
-
+    // Flush accumulated base rows to one bulk insert every FLUSH_BATCH items so
+    // a large import does not buffer every row's JSON in memory at once.
+    const FLUSH_BATCH: usize = 1000;
     let mut total_bytes: usize = 0;
-    let mut base_rows: Vec<BaseItemRow> = Vec::with_capacity(item_count);
 
-    let result: Result<()> = async {
+    // The whole import is one transaction: any failure rolls everything back.
+    helpers::with_write_transaction(storage, async {
+        // Pre-fetch the next stream sequence number once (fix: O(n) → O(1))
+        let mut next_seq = if options.record_streams && meta.stream_enabled {
+            storage.next_stream_sequence_number(table_name).await?
+        } else {
+            0
+        };
+
+        let mut base_rows: Vec<BaseItemRow> = Vec::with_capacity(item_count.min(FLUSH_BATCH));
+
         for mut item in items {
             // 5. Validate required keys and extract pk/sk
             helpers::validate_item_keys(&item, &key_schema, &meta)?;
@@ -243,8 +245,8 @@ async fn execute_inner<S: StorageBackend>(
                     .await?;
             }
 
-            // Collect the base row; all base inserts run as one batch after
-            // the loop (same transaction, identical final state).
+            // Collect the base row; base inserts flush in batches here (and a
+            // final flush after the loop), all inside this one transaction.
             base_rows.push(BaseItemRow {
                 pk,
                 sk,
@@ -253,24 +255,20 @@ async fn execute_inner<S: StorageBackend>(
                 cached_at: cached_at_val,
                 hash_prefix,
             });
+            if base_rows.len() >= FLUSH_BATCH {
+                storage.put_base_items(table_name, &base_rows).await?;
+                base_rows.clear();
+            }
         }
-        storage.put_base_items(table_name, &base_rows).await?;
+        if !base_rows.is_empty() {
+            storage.put_base_items(table_name, &base_rows).await?;
+        }
         Ok(())
-    }
-    .await;
+    })
+    .await?;
 
-    // 10. Commit or rollback
-    match result {
-        Ok(()) => {
-            storage.commit().await?;
-            Ok(ImportResult {
-                items_imported: item_count,
-                bytes_imported: total_bytes,
-            })
-        }
-        Err(e) => {
-            let _ = storage.rollback().await;
-            Err(e)
-        }
-    }
+    Ok(ImportResult {
+        items_imported: item_count,
+        bytes_imported: total_bytes,
+    })
 }

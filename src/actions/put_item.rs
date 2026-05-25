@@ -291,9 +291,7 @@ pub async fn execute<S: StorageBackend>(
     // leaving no torn index. The transaction is unconditional (not just for
     // ConditionExpression) because the atomicity guarantee applies to every
     // single-item write.
-    storage.begin_transaction().await?;
-
-    let write_result: Result<(Option<String>, HashMap<String, f64>)> = async {
+    let (old_json, gsi_units) = helpers::with_write_transaction(storage, async {
         // Evaluate ConditionExpression against existing item (if any)
         let old_json = if request.condition_expression.is_some() {
             let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
@@ -407,18 +405,8 @@ pub async fn execute<S: StorageBackend>(
         .await?;
 
         Ok((old_json, gsi_units))
-    }
-    .await;
-
-    // Commit on success, roll back the whole write on any failure.
-    match write_result {
-        Ok(_) => storage.commit().await?,
-        Err(ref _e) => {
-            let _ = storage.rollback().await;
-        }
-    }
-
-    let (old_json, gsi_units) = write_result?;
+    })
+    .await?;
 
     // Handle ReturnValues
     let return_old = request
