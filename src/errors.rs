@@ -88,6 +88,24 @@ pub enum DynoxideError {
     SqliteError(#[from] rusqlite::Error),
 }
 
+/// Backend-layer failures (`BackendError`) are storage-level faults: a locked
+/// database, an I/O error, a constraint the application layer did not
+/// anticipate. None of them is part of DynamoDB's client-facing error contract,
+/// so they all surface as `InternalServerError` (HTTP 500), matching how a raw
+/// `rusqlite::Error` surfaces today via `SqliteError`. Client-facing failures
+/// (conditional checks, validation) never travel through `BackendError`; the
+/// handlers construct those `DynoxideError` variants directly, so this
+/// conversion is not lossy on the native path.
+///
+/// A one-way `From` is deliberate rather than merging the two types:
+/// `BackendError` is the narrow storage vocabulary, `DynoxideError` the wider
+/// API vocabulary. A merge is deferred.
+impl From<crate::storage_backend::BackendError> for DynoxideError {
+    fn from(err: crate::storage_backend::BackendError) -> Self {
+        DynoxideError::InternalServerError(err.to_string())
+    }
+}
+
 impl DynoxideError {
     /// Returns the DynamoDB `__type` string for this error.
     pub fn error_type(&self) -> &'static str {
@@ -378,5 +396,14 @@ mod tests {
         // Uses capital Message (not lowercase)
         assert!(json.get("Message").is_some());
         assert!(json.get("message").is_none());
+    }
+
+    #[test]
+    fn test_backend_error_maps_to_internal() {
+        use crate::storage_backend::BackendError;
+        let err: DynoxideError = BackendError::Locked.into();
+        assert_eq!(err.status_code(), 500);
+        assert!(err.error_type().contains("InternalServerError"));
+        assert!(err.to_string().contains("locked"));
     }
 }
