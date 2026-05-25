@@ -1,6 +1,6 @@
 use crate::errors::{DynoxideError, Result};
 use crate::partiql;
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 
@@ -40,8 +40,8 @@ pub struct BatchStatementError {
     pub message: String,
 }
 
-pub fn execute(
-    storage: &Storage,
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
     request: BatchExecuteStatementRequest,
 ) -> Result<BatchExecuteStatementResponse> {
     if request.statements.is_empty() {
@@ -71,7 +71,7 @@ pub fn execute(
             },
             Ok(stmt) => {
                 let params = stmt_req.parameters.as_deref().unwrap_or_default();
-                match partiql::executor::execute(storage, &stmt, params, None) {
+                match partiql::executor::execute(storage, &stmt, params, None).await {
                     Ok(Some(items)) => {
                         // For SELECT, return first item (batch returns single item per statement)
                         BatchStatementResponse {

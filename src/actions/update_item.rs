@@ -1,6 +1,6 @@
 use crate::actions::helpers;
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{self, AttributeValue};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -187,7 +187,10 @@ fn wrap_invalid_update_expression(err: String) -> String {
     }
 }
 
-pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<UpdateItemResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    mut request: UpdateItemRequest,
+) -> Result<UpdateItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
 
@@ -372,7 +375,7 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
         }
     }
 
-    let meta = helpers::require_table_for_item_op(storage, &request.table_name)?;
+    let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
 
     // Validate ReturnValues parameter
@@ -405,7 +408,7 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
     // Wrap condition check + write in a transaction to prevent TOCTOU races
     let has_condition = request.condition_expression.is_some();
     if has_condition {
-        storage.begin_transaction()?;
+        storage.begin_transaction().await?;
     }
 
     // Execution tracker — tracking disabled because unused-reference validation was
@@ -417,10 +420,10 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
     );
 
     // Execute the condition check + update + write atomically within a transaction.
-    // The closure captures everything from get_item through put_item.
-    let transactional_work = || -> Result<UpdateWorkResult> {
+    // The block captures everything from get_item through put_item.
+    let result: Result<UpdateWorkResult> = async {
         // Fetch existing item (or create empty one for upsert)
-        let existing_json = storage.get_item(&request.table_name, &pk, &sk)?;
+        let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
         let existing_item: HashMap<String, AttributeValue> = existing_json
             .as_ref()
             .and_then(|j| serde_json::from_str(j).ok())
@@ -539,14 +542,16 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
             .get(&key_schema.partition_key)
             .map(crate::storage::compute_hash_prefix)
             .unwrap_or_default();
-        storage.put_item_with_hash(
-            &request.table_name,
-            &pk,
-            &sk,
-            &item_json,
-            size,
-            &hash_prefix,
-        )?;
+        storage
+            .put_item_with_hash(
+                &request.table_name,
+                &pk,
+                &sk,
+                &item_json,
+                size,
+                &hash_prefix,
+            )
+            .await?;
 
         Ok(UpdateWorkResult {
             existing_json,
@@ -555,16 +560,15 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
             item_json,
             size,
         })
-    };
-
-    let result = transactional_work();
+    }
+    .await;
 
     // Commit or rollback the condition+write transaction
     if has_condition {
         match result {
-            Ok(_) => storage.commit()?,
+            Ok(_) => storage.commit().await?,
             Err(ref _e) => {
-                let _ = storage.rollback();
+                let _ = storage.rollback().await;
             }
         }
     }
@@ -587,7 +591,8 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
         &item,
         &key_schema.partition_key,
         key_schema.sort_key.as_deref(),
-    )?;
+    )
+    .await?;
 
     // Maintain LSI tables
     super::lsi::maintain_lsis_after_write(
@@ -599,7 +604,8 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
         &item,
         &key_schema.partition_key,
         key_schema.sort_key.as_deref(),
-    )?;
+    )
+    .await?;
 
     // Record stream event
     let old_for_stream = if existing_json.is_some() {
@@ -607,7 +613,7 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
     } else {
         None
     };
-    crate::streams::record_stream_event(storage, &meta, old_for_stream, Some(&item))?;
+    crate::streams::record_stream_event(storage, &meta, old_for_stream, Some(&item)).await?;
 
     // Handle ReturnValues
     let return_values = request.return_values.as_deref().unwrap_or("NONE");
@@ -667,7 +673,8 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
             .as_ref()
             .unwrap_or(&AttributeValue::S(String::new())),
         &request.return_item_collection_metrics,
-    )?;
+    )
+    .await?;
 
     let consumed_capacity = types::consumed_capacity_with_indexes(
         &request.table_name,

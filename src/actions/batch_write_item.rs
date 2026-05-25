@@ -1,6 +1,6 @@
 use crate::actions::helpers;
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{self, AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -48,8 +48,8 @@ pub struct BatchWriteItemResponse {
     pub item_collection_metrics: Option<HashMap<String, Vec<crate::types::ItemCollectionMetrics>>>,
 }
 
-pub fn execute(
-    storage: &Storage,
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
     mut request: BatchWriteItemRequest,
 ) -> Result<BatchWriteItemResponse> {
     const MAX_REQUEST_SIZE: usize = 16 * 1024 * 1024; // 16MB
@@ -156,7 +156,7 @@ pub fn execute(
         let mut seen_keys: std::collections::HashSet<(String, String, String)> =
             std::collections::HashSet::new();
         for (table_name, write_requests) in &request.request_items {
-            let meta = helpers::require_table_for_item_op(storage, table_name)?;
+            let meta = helpers::require_table_for_item_op(storage, table_name).await?;
             let key_schema = helpers::parse_key_schema(&meta)?;
             for wr in write_requests {
                 let key_item = if let Some(ref put) = wr.put_request {
@@ -192,7 +192,7 @@ pub fn execute(
     // level and pass pre-parsed defs into the maintenance functions.
 
     for (table_name, write_requests) in &mut request.request_items {
-        let meta = helpers::require_table_for_item_op(storage, table_name)?;
+        let meta = helpers::require_table_for_item_op(storage, table_name).await?;
         let key_schema = helpers::parse_key_schema(&meta)?;
 
         for wr in write_requests {
@@ -223,14 +223,9 @@ pub fn execute(
                     .get(&key_schema.partition_key)
                     .map(crate::storage::compute_hash_prefix)
                     .unwrap_or_default();
-                let old_json = storage.put_item_with_hash(
-                    table_name,
-                    &pk,
-                    &sk,
-                    &item_json,
-                    size,
-                    &hash_prefix,
-                )?;
+                let old_json = storage
+                    .put_item_with_hash(table_name, &pk, &sk, &item_json, size, &hash_prefix)
+                    .await?;
 
                 // Accumulate WCU based on item size
                 *table_wcu.entry(table_name.clone()).or_insert(0.0) +=
@@ -246,7 +241,8 @@ pub fn execute(
                     &put_req.item,
                     &key_schema.partition_key,
                     key_schema.sort_key.as_deref(),
-                )?;
+                )
+                .await?;
 
                 // Accumulate GSI units per table
                 let table_entry = table_gsi_units.entry(table_name.clone()).or_default();
@@ -264,7 +260,8 @@ pub fn execute(
                     &put_req.item,
                     &key_schema.partition_key,
                     key_schema.sort_key.as_deref(),
-                )?;
+                )
+                .await?;
 
                 // Track affected partition for deferred metrics
                 if let Some(pk_val) = put_req.item.get(&key_schema.partition_key) {
@@ -283,12 +280,13 @@ pub fn execute(
                     &meta,
                     old_item.as_ref(),
                     Some(&put_req.item),
-                )?;
+                )
+                .await?;
             } else if let Some(ref del_req) = wr.delete_request {
                 helpers::validate_key_only(&del_req.key, &key_schema)?;
                 // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
                 let (pk, sk) = helpers::extract_key_strings(&del_req.key, &key_schema)?;
-                let old_json = storage.delete_item(table_name, &pk, &sk)?;
+                let old_json = storage.delete_item(table_name, &pk, &sk).await?;
 
                 // Accumulate WCU: based on old item size if it existed, else 1 WCU
                 let old_item: Option<Item> =
@@ -302,7 +300,8 @@ pub fn execute(
 
                 // Maintain GSI tables
                 let gsi_units =
-                    super::gsi::maintain_gsis_after_delete(storage, table_name, &meta, &pk, &sk)?;
+                    super::gsi::maintain_gsis_after_delete(storage, table_name, &meta, &pk, &sk)
+                        .await?;
 
                 // Accumulate GSI units per table
                 let table_entry = table_gsi_units.entry(table_name.clone()).or_default();
@@ -311,7 +310,8 @@ pub fn execute(
                 }
 
                 // Maintain LSI tables
-                super::lsi::maintain_lsis_after_delete(storage, table_name, &meta, &pk, &sk)?;
+                super::lsi::maintain_lsis_after_delete(storage, table_name, &meta, &pk, &sk)
+                    .await?;
 
                 // Track affected partition for deferred metrics
                 if let Some(pk_val) = del_req.key.get(&key_schema.partition_key) {
@@ -325,7 +325,8 @@ pub fn execute(
 
                 // Record stream event (old_item already parsed above)
                 if old_item.is_some() {
-                    crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None)?;
+                    crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None)
+                        .await?;
                 }
             } else {
                 return Err(DynoxideError::ValidationException(
@@ -372,7 +373,7 @@ pub fn execute(
             if !seen.insert(key) {
                 continue;
             }
-            let meta = helpers::require_table(storage, tbl)?;
+            let meta = helpers::require_table(storage, tbl).await?;
             if let Some(icm) = helpers::build_item_collection_metrics(
                 storage,
                 &meta,
@@ -381,7 +382,9 @@ pub fn execute(
                 pk_attr,
                 pk_val,
                 &request.return_item_collection_metrics,
-            )? {
+            )
+            .await?
+            {
                 all_item_collection_metrics
                     .entry(tbl.clone())
                     .or_default()

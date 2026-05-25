@@ -1,7 +1,7 @@
 use crate::actions::helpers;
 use crate::errors::{DynoxideError, Result};
 use crate::expressions;
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -168,7 +168,10 @@ pub struct ScanResponse {
     pub consumed_capacity: Option<crate::types::ConsumedCapacity>,
 }
 
-pub fn execute(storage: &Storage, mut request: ScanRequest) -> Result<ScanResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    mut request: ScanRequest,
+) -> Result<ScanResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
 
@@ -325,7 +328,7 @@ pub fn execute(storage: &Storage, mut request: ScanRequest) -> Result<ScanRespon
         ));
     }
 
-    let meta = helpers::require_table_for_item_op(storage, &request.table_name)?;
+    let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let table_key_schema = helpers::parse_key_schema(&meta)?;
 
     // Convert legacy AttributesToGet to ProjectionExpression if no expression-based
@@ -457,12 +460,18 @@ pub fn execute(storage: &Storage, mut request: ScanRequest) -> Result<ScanRespon
     };
     let rows = if let Some(ref index_name) = request.index_name {
         if is_lsi {
-            storage.scan_lsi_items(&request.table_name, index_name, &scan_params)?
+            storage
+                .scan_lsi_items(&request.table_name, index_name, &scan_params)
+                .await?
         } else {
-            storage.scan_gsi_items(&request.table_name, index_name, &scan_params)?
+            storage
+                .scan_gsi_items(&request.table_name, index_name, &scan_params)
+                .await?
         }
     } else {
-        storage.scan_items(&request.table_name, &scan_params)?
+        storage
+            .scan_items(&request.table_name, &scan_params)
+            .await?
     };
 
     // Create tracker for unused expression attribute names/values

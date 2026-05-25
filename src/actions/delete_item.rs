@@ -1,6 +1,6 @@
 use crate::actions::helpers;
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{self, AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -145,7 +145,10 @@ pub struct DeleteItemResponse {
     pub item_collection_metrics: Option<crate::types::ItemCollectionMetrics>,
 }
 
-pub fn execute(storage: &Storage, mut request: DeleteItemRequest) -> Result<DeleteItemResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    mut request: DeleteItemRequest,
+) -> Result<DeleteItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
 
@@ -238,7 +241,7 @@ pub fn execute(storage: &Storage, mut request: DeleteItemRequest) -> Result<Dele
         }
     }
 
-    let meta = helpers::require_table_for_item_op(storage, &request.table_name)?;
+    let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
 
     // Validate ReturnValues parameter (DeleteItem only supports NONE and ALL_OLD)
@@ -276,13 +279,13 @@ pub fn execute(storage: &Storage, mut request: DeleteItemRequest) -> Result<Dele
     // Wrap condition check + delete in a transaction to prevent TOCTOU races
     let has_condition = request.condition_expression.is_some();
     if has_condition {
-        storage.begin_transaction()?;
+        storage.begin_transaction().await?;
     }
 
-    let conditional_result = (|| -> Result<Option<String>> {
+    let conditional_result: Result<Option<String>> = async {
         // Evaluate ConditionExpression against existing item
         if let Some(ref cond_expr) = request.condition_expression {
-            let existing_json = storage.get_item(&request.table_name, &pk, &sk)?;
+            let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
             let existing_item: HashMap<String, AttributeValue> = existing_json
                 .as_ref()
                 .and_then(|j| serde_json::from_str(j).ok())
@@ -312,15 +315,16 @@ pub fn execute(storage: &Storage, mut request: DeleteItemRequest) -> Result<Dele
         tracker.check_unused()?;
 
         // Delete item (returns old item_json)
-        storage.delete_item(&request.table_name, &pk, &sk)
-    })();
+        Ok(storage.delete_item(&request.table_name, &pk, &sk).await?)
+    }
+    .await;
 
     // Handle transaction commit/rollback
     if has_condition {
         match conditional_result {
-            Ok(_) => storage.commit()?,
+            Ok(_) => storage.commit().await?,
             Err(ref _e) => {
-                let _ = storage.rollback();
+                let _ = storage.rollback().await;
             }
         }
     }
@@ -329,16 +333,18 @@ pub fn execute(storage: &Storage, mut request: DeleteItemRequest) -> Result<Dele
 
     // Maintain GSI tables
     let gsi_units =
-        super::gsi::maintain_gsis_after_delete(storage, &request.table_name, &meta, &pk, &sk)?;
+        super::gsi::maintain_gsis_after_delete(storage, &request.table_name, &meta, &pk, &sk)
+            .await?;
 
     // Maintain LSI tables
-    super::lsi::maintain_lsis_after_delete(storage, &request.table_name, &meta, &pk, &sk)?;
+    super::lsi::maintain_lsis_after_delete(storage, &request.table_name, &meta, &pk, &sk).await?;
 
     // Record stream event
     let old_item_for_stream: Option<Item> =
         old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
     if old_item_for_stream.is_some() {
-        crate::streams::record_stream_event(storage, &meta, old_item_for_stream.as_ref(), None)?;
+        crate::streams::record_stream_event(storage, &meta, old_item_for_stream.as_ref(), None)
+            .await?;
     }
 
     // Handle ReturnValues
@@ -366,7 +372,8 @@ pub fn execute(storage: &Storage, mut request: DeleteItemRequest) -> Result<Dele
             .as_ref()
             .unwrap_or(&AttributeValue::S(String::new())),
         &request.return_item_collection_metrics,
-    )?;
+    )
+    .await?;
 
     // Calculate consumed capacity from old item size (write for delete)
     let old_size = old_item_for_stream

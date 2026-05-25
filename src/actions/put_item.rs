@@ -1,6 +1,6 @@
 use crate::actions::helpers;
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{self, AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -144,7 +144,10 @@ pub struct PutItemResponse {
     pub item_collection_metrics: Option<crate::types::ItemCollectionMetrics>,
 }
 
-pub fn execute(storage: &Storage, mut request: PutItemRequest) -> Result<PutItemResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    mut request: PutItemRequest,
+) -> Result<PutItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
 
@@ -227,7 +230,7 @@ pub fn execute(storage: &Storage, mut request: PutItemRequest) -> Result<PutItem
         ));
     }
 
-    let meta = helpers::require_table_for_item_op(storage, &request.table_name)?;
+    let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
 
     // Convert legacy Expected parameter to ConditionExpression if no expression is set
@@ -286,13 +289,13 @@ pub fn execute(storage: &Storage, mut request: PutItemRequest) -> Result<PutItem
     // Wrap condition check + write in a transaction to prevent TOCTOU races
     let has_condition = request.condition_expression.is_some();
     if has_condition {
-        storage.begin_transaction()?;
+        storage.begin_transaction().await?;
     }
 
-    let conditional_result = (|| -> Result<(Option<String>, String)> {
+    let conditional_result: Result<(Option<String>, String)> = async {
         // Evaluate ConditionExpression against existing item (if any)
         let old_json = if request.condition_expression.is_some() {
-            let existing_json = storage.get_item(&request.table_name, &pk, &sk)?;
+            let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
             let existing_item: HashMap<String, AttributeValue> = existing_json
                 .as_ref()
                 .and_then(|j| serde_json::from_str(j).ok())
@@ -341,35 +344,40 @@ pub fn execute(storage: &Storage, mut request: PutItemRequest) -> Result<PutItem
         // Store item (returns old item if it existed)
         // If we already fetched old_json for condition check, use put_item but ignore its return
         let old_json = if old_json.is_some() {
-            storage.put_item_with_hash(
-                &request.table_name,
-                &pk,
-                &sk,
-                &item_json,
-                size,
-                &hash_prefix,
-            )?;
+            storage
+                .put_item_with_hash(
+                    &request.table_name,
+                    &pk,
+                    &sk,
+                    &item_json,
+                    size,
+                    &hash_prefix,
+                )
+                .await?;
             old_json
         } else {
-            storage.put_item_with_hash(
-                &request.table_name,
-                &pk,
-                &sk,
-                &item_json,
-                size,
-                &hash_prefix,
-            )?
+            storage
+                .put_item_with_hash(
+                    &request.table_name,
+                    &pk,
+                    &sk,
+                    &item_json,
+                    size,
+                    &hash_prefix,
+                )
+                .await?
         };
 
         Ok((old_json, item_json))
-    })();
+    }
+    .await;
 
     // Handle transaction commit/rollback
     if has_condition {
         match conditional_result {
-            Ok(_) => storage.commit()?,
+            Ok(_) => storage.commit().await?,
             Err(ref _e) => {
-                let _ = storage.rollback();
+                let _ = storage.rollback().await;
             }
         }
     }
@@ -386,7 +394,8 @@ pub fn execute(storage: &Storage, mut request: PutItemRequest) -> Result<PutItem
         &request.item,
         &key_schema.partition_key,
         key_schema.sort_key.as_deref(),
-    )?;
+    )
+    .await?;
 
     // Maintain LSI tables
     super::lsi::maintain_lsis_after_write(
@@ -398,7 +407,8 @@ pub fn execute(storage: &Storage, mut request: PutItemRequest) -> Result<PutItem
         &request.item,
         &key_schema.partition_key,
         key_schema.sort_key.as_deref(),
-    )?;
+    )
+    .await?;
 
     // Record stream event
     let old_item_for_stream: Option<Item> =
@@ -408,7 +418,8 @@ pub fn execute(storage: &Storage, mut request: PutItemRequest) -> Result<PutItem
         &meta,
         old_item_for_stream.as_ref(),
         Some(&request.item),
-    )?;
+    )
+    .await?;
 
     // Handle ReturnValues
     let return_old = request
@@ -437,7 +448,8 @@ pub fn execute(storage: &Storage, mut request: PutItemRequest) -> Result<PutItem
             .as_ref()
             .unwrap_or(&AttributeValue::S(String::new())),
         &request.return_item_collection_metrics,
-    )?;
+    )
+    .await?;
 
     let consumed_capacity = types::consumed_capacity_with_indexes(
         &request.table_name,

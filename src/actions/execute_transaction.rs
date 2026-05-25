@@ -1,6 +1,6 @@
 use crate::errors::{CancellationReason, DynoxideError, Result};
 use crate::partiql;
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 
@@ -36,8 +36,8 @@ pub struct ItemResponse {
     pub item: Option<Item>,
 }
 
-pub fn execute(
-    storage: &Storage,
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
     request: ExecuteTransactionRequest,
 ) -> Result<ExecuteTransactionResponse> {
     let statements = &request.transact_statements;
@@ -67,13 +67,13 @@ pub fn execute(
     }
 
     // Begin SQLite transaction
-    storage.begin_transaction()?;
+    storage.begin_transaction().await?;
 
-    let result = execute_within_transaction(storage, &parsed);
+    let result = execute_within_transaction(storage, &parsed).await;
 
     match result {
         Ok(responses) => {
-            storage.commit()?;
+            storage.commit().await?;
 
             // Build ConsumedCapacity if requested (simple estimate: 1 WCU per statement)
             let consumed_capacity = if matches!(
@@ -109,7 +109,7 @@ pub fn execute(
             })
         }
         Err(e) => {
-            if let Err(rb_err) = storage.rollback() {
+            if let Err(rb_err) = storage.rollback().await {
                 return Err(DynoxideError::InternalServerError(format!(
                     "Transaction failed ({e}) and rollback also failed ({rb_err})"
                 )));
@@ -119,15 +119,15 @@ pub fn execute(
     }
 }
 
-fn execute_within_transaction(
-    storage: &Storage,
+async fn execute_within_transaction<S: StorageBackend>(
+    storage: &S,
     parsed: &[(partiql::parser::Statement, Vec<AttributeValue>)],
 ) -> Result<Vec<ItemResponse>> {
     let mut responses = Vec::with_capacity(parsed.len());
     let mut cancellation_reasons: Vec<CancellationReason> = Vec::with_capacity(parsed.len());
 
     for (stmt, params) in parsed {
-        match partiql::executor::execute(storage, stmt, params, None) {
+        match partiql::executor::execute(storage, stmt, params, None).await {
             Ok(result) => {
                 let item = result.and_then(|items| items.into_iter().next());
                 responses.push(ItemResponse { item });

@@ -1,6 +1,6 @@
 use crate::errors::{DynoxideError, Result};
 use crate::partiql;
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 
@@ -28,8 +28,8 @@ pub struct ExecuteStatementResponse {
     pub next_token: Option<String>,
 }
 
-pub fn execute(
-    storage: &Storage,
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
     request: ExecuteStatementRequest,
 ) -> Result<ExecuteStatementResponse> {
     let stmt = partiql::parser::parse(&request.statement).map_err(|e| {
@@ -37,7 +37,7 @@ pub fn execute(
     })?;
 
     let params = request.parameters.unwrap_or_default();
-    let result = partiql::executor::execute(storage, &stmt, &params, request.limit)?;
+    let result = partiql::executor::execute(storage, &stmt, &params, request.limit).await?;
 
     Ok(ExecuteStatementResponse {
         items: result,

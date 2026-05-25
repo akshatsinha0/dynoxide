@@ -2,7 +2,7 @@ use crate::actions::create_table::StreamSpecification;
 use crate::actions::{TableDescription, build_table_description};
 use crate::actions::{gsi, helpers};
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::streams;
 use crate::types::{AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, Projection};
 use crate::validation;
@@ -144,7 +144,10 @@ pub struct UpdateTableResponse {
     pub table_description: TableDescription,
 }
 
-pub fn execute(storage: &Storage, request: UpdateTableRequest) -> Result<UpdateTableResponse> {
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    request: UpdateTableRequest,
+) -> Result<UpdateTableResponse> {
     // Table name validation is handled in the Deserialize impl
 
     // Phase 1: Validate request parameters BEFORE table existence check
@@ -153,7 +156,7 @@ pub fn execute(storage: &Storage, request: UpdateTableRequest) -> Result<UpdateT
     validate_update_request(&request)?;
 
     // Phase 2: Table existence check
-    let meta = helpers::require_table(storage, &request.table_name)?;
+    let meta = helpers::require_table(storage, &request.table_name).await?;
 
     let current_billing_mode = meta.billing_mode.as_deref().unwrap_or("PROVISIONED");
 
@@ -354,9 +357,9 @@ pub fn execute(storage: &Storage, request: UpdateTableRequest) -> Result<UpdateT
     let is_decrease = new_rcu < cur_rcu || new_wcu < cur_wcu;
 
     // All validation passed — perform mutations inside a transaction
-    storage.begin_transaction()?;
+    storage.begin_transaction().await?;
 
-    let result = (|| -> Result<()> {
+    let result: Result<()> = async {
         if let Some(ref updates) = request.global_secondary_index_updates {
             for update in updates {
                 if let Some(ref create) = update.create {
@@ -367,16 +370,20 @@ pub fn execute(storage: &Storage, request: UpdateTableRequest) -> Result<UpdateT
                         provisioned_throughput: None,
                     };
 
-                    storage.create_gsi_table(&request.table_name, &create.index_name)?;
+                    storage
+                        .create_gsi_table(&request.table_name, &create.index_name)
+                        .await?;
 
                     let gsi_p = gsi::gsi_to_def(&gsi_def)?;
-                    backfill_gsi(storage, &request.table_name, &key_schema, &gsi_p)?;
+                    backfill_gsi(storage, &request.table_name, &key_schema, &gsi_p).await?;
 
                     current_gsis.push(gsi_def);
                 }
 
                 if let Some(ref delete) = update.delete {
-                    storage.drop_gsi_table(&request.table_name, &delete.index_name)?;
+                    storage
+                        .drop_gsi_table(&request.table_name, &delete.index_name)
+                        .await?;
                     current_gsis.retain(|g| g.index_name != delete.index_name);
                 }
             }
@@ -394,7 +401,9 @@ pub fn execute(storage: &Storage, request: UpdateTableRequest) -> Result<UpdateT
             )
         };
 
-        storage.update_table_metadata(&request.table_name, &attr_defs_json, gsi_json.as_deref())?;
+        storage
+            .update_table_metadata(&request.table_name, &attr_defs_json, gsi_json.as_deref())
+            .await?;
 
         // Update provisioned throughput if requested
         if is_pt_update {
@@ -419,20 +428,28 @@ pub fn execute(storage: &Storage, request: UpdateTableRequest) -> Result<UpdateT
             }
             let pt_json = serde_json::to_string(&stored)
                 .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
-            storage.update_provisioned_throughput(&request.table_name, &pt_json)?;
+            storage
+                .update_provisioned_throughput(&request.table_name, &pt_json)
+                .await?;
         }
 
         // Handle deletion protection changes
         if let Some(enabled) = request.deletion_protection_enabled {
-            storage.update_deletion_protection(&request.table_name, enabled)?;
+            storage
+                .update_deletion_protection(&request.table_name, enabled)
+                .await?;
         }
 
         // Handle billing mode changes
         if let Some(ref billing_mode) = request.billing_mode {
-            storage.update_billing_mode(&request.table_name, billing_mode)?;
+            storage
+                .update_billing_mode(&request.table_name, billing_mode)
+                .await?;
             if billing_mode == "PAY_PER_REQUEST" {
                 // Clear provisioned throughput to avoid stale data
-                storage.clear_provisioned_throughput(&request.table_name)?;
+                storage
+                    .clear_provisioned_throughput(&request.table_name)
+                    .await?;
             }
         }
 
@@ -444,25 +461,28 @@ pub fn execute(storage: &Storage, request: UpdateTableRequest) -> Result<UpdateT
                     .as_deref()
                     .unwrap_or("NEW_AND_OLD_IMAGES");
                 let label = streams::generate_stream_label(storage.clock());
-                storage.enable_stream(&request.table_name, view_type, &label)?;
+                storage
+                    .enable_stream(&request.table_name, view_type, &label)
+                    .await?;
             } else {
-                storage.disable_stream(&request.table_name)?;
+                storage.disable_stream(&request.table_name).await?;
             }
         }
 
         Ok(())
-    })();
+    }
+    .await;
 
     match result {
-        Ok(()) => storage.commit()?,
+        Ok(()) => storage.commit().await?,
         Err(e) => {
-            let _ = storage.rollback();
+            let _ = storage.rollback().await;
             return Err(e);
         }
     }
 
     // Build response from updated metadata
-    let updated_meta = helpers::require_table(storage, &request.table_name)?;
+    let updated_meta = helpers::require_table(storage, &request.table_name).await?;
     let mut desc = build_table_description(&updated_meta, Some(0), Some(0));
 
     // DynamoDB returns UPDATING status during throughput changes
@@ -727,8 +747,8 @@ fn parse_stored_throughput(
 }
 
 /// Backfill existing items into a newly created GSI, processing in batches.
-fn backfill_gsi(
-    storage: &Storage,
+async fn backfill_gsi<S: StorageBackend>(
+    storage: &S,
     table_name: &str,
     key_schema: &helpers::KeySchema,
     gsi_def: &gsi::GsiDef,
@@ -738,15 +758,17 @@ fn backfill_gsi(
     let mut last_sk: Option<String> = None;
 
     loop {
-        let items = storage.scan_items(
-            table_name,
-            &crate::storage::ScanParams {
-                limit: Some(BATCH_SIZE),
-                exclusive_start_pk: last_pk.as_deref(),
-                exclusive_start_sk: last_sk.as_deref(),
-                ..Default::default()
-            },
-        )?;
+        let items = storage
+            .scan_items(
+                table_name,
+                &crate::storage::ScanParams {
+                    limit: Some(BATCH_SIZE),
+                    exclusive_start_pk: last_pk.as_deref(),
+                    exclusive_start_sk: last_sk.as_deref(),
+                    ..Default::default()
+                },
+            )
+            .await?;
 
         if items.is_empty() {
             break;
@@ -785,7 +807,9 @@ fn backfill_gsi(
             }
         }
 
-        storage.insert_gsi_items(table_name, &gsi_def.index_name, &rows)?;
+        storage
+            .insert_gsi_items(table_name, &gsi_def.index_name, &rows)
+            .await?;
 
         let last = &items[items.len() - 1];
         last_pk = Some(last.0.clone());

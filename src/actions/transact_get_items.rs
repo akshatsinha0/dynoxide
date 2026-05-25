@@ -1,7 +1,7 @@
 use crate::actions::helpers;
 use crate::errors::{CancellationReason, DynoxideError, Result};
 use crate::expressions;
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -46,8 +46,8 @@ pub struct TransactGetResponse {
     pub item: Option<Item>,
 }
 
-pub fn execute(
-    storage: &Storage,
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
     request: TransactGetItemsRequest,
 ) -> Result<TransactGetItemsResponse> {
     // Validate: at least 1 action
@@ -86,7 +86,7 @@ pub fn execute(
 
     for transact_item in &request.transact_items {
         let get = &transact_item.get;
-        match validate_action(storage, get) {
+        match validate_action(storage, get).await {
             Ok(schema) => {
                 reasons.push(CancellationReason {
                     code: "None".to_string(),
@@ -150,7 +150,7 @@ pub fn execute(
         // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
         let (pk, sk) = helpers::extract_key_strings(&get.key, key_schema)?;
 
-        let item_json = storage.get_item(&get.table_name, &pk, &sk)?;
+        let item_json = storage.get_item(&get.table_name, &pk, &sk).await?;
 
         let item: Option<Item> = item_json.and_then(|j| serde_json::from_str(&j).ok());
 
@@ -226,9 +226,12 @@ pub fn execute(
 /// TransactGet action: table-name shape, table existence, parsed key schema,
 /// and key shape against that schema. Returns the resolved KeySchema so the
 /// caller can avoid re-parsing it before extract_key_strings.
-fn validate_action(storage: &Storage, get: &TransactGet) -> Result<helpers::KeySchema> {
+async fn validate_action<S: StorageBackend>(
+    storage: &S,
+    get: &TransactGet,
+) -> Result<helpers::KeySchema> {
     crate::validation::validate_table_name(&get.table_name)?;
-    let meta = helpers::require_table_for_item_op(storage, &get.table_name)?;
+    let meta = helpers::require_table_for_item_op(storage, &get.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
     helpers::validate_key_only(&get.key, &key_schema)?;
     Ok(key_schema)

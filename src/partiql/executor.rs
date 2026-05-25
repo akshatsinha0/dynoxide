@@ -6,7 +6,7 @@ use crate::errors::{DynoxideError, Result};
 use crate::partiql::parser::{
     CompOp, PartiqlValue, SetValue, Statement, WhereClause, WhereCondition,
 };
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
 use std::collections::HashMap;
 
@@ -14,8 +14,8 @@ use std::collections::HashMap;
 ///
 /// Returns `Some(items)` for SELECT (may be empty), `None` for write operations.
 /// An optional `limit` restricts how many items a SELECT returns.
-pub fn execute(
-    storage: &Storage,
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
     stmt: &Statement,
     parameters: &[AttributeValue],
     limit: Option<usize>,
@@ -25,20 +25,23 @@ pub fn execute(
             table_name,
             projections,
             where_clause,
-        } => execute_select(
-            storage,
-            table_name,
-            projections,
-            where_clause.as_ref(),
-            parameters,
-            limit,
-        ),
+        } => {
+            execute_select(
+                storage,
+                table_name,
+                projections,
+                where_clause.as_ref(),
+                parameters,
+                limit,
+            )
+            .await
+        }
         Statement::Insert {
             table_name,
             item,
             if_not_exists,
         } => {
-            execute_insert(storage, table_name, item, parameters, *if_not_exists)?;
+            execute_insert(storage, table_name, item, parameters, *if_not_exists).await?;
             Ok(None)
         }
         Statement::Update {
@@ -54,14 +57,15 @@ pub fn execute(
                 remove_paths,
                 where_clause.as_ref(),
                 parameters,
-            )?;
+            )
+            .await?;
             Ok(None)
         }
         Statement::Delete {
             table_name,
             where_clause,
         } => {
-            execute_delete(storage, table_name, where_clause.as_ref(), parameters)?;
+            execute_delete(storage, table_name, where_clause.as_ref(), parameters).await?;
             Ok(None)
         }
     }
@@ -79,15 +83,15 @@ fn insert_nested_projection(result: &mut Item, path: &str, val: AttributeValue) 
     result.insert(key.to_string(), val);
 }
 
-fn execute_select(
-    storage: &Storage,
+async fn execute_select<S: StorageBackend>(
+    storage: &S,
     table_name: &str,
     projections: &[String],
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
     limit: Option<usize>,
 ) -> Result<Option<Vec<Item>>> {
-    let meta = require_table(storage, table_name)?;
+    let meta = require_table(storage, table_name).await?;
     let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
 
     // Check for COUNT(*) projection
@@ -99,7 +103,8 @@ fn execute_select(
             parameters,
             &key_schema,
             None,
-        )?;
+        )
+        .await?;
         let count = items.len();
         let mut result = HashMap::new();
         result.insert("Count".to_string(), AttributeValue::N(count.to_string()));
@@ -113,7 +118,8 @@ fn execute_select(
         parameters,
         &key_schema,
         limit,
-    )?;
+    )
+    .await?;
 
     // Apply projections
     let items = if projections.is_empty() {
@@ -137,8 +143,8 @@ fn execute_select(
 }
 
 /// Collect items that match the WHERE clause, optionally limited.
-fn collect_matching_items(
-    storage: &Storage,
+async fn collect_matching_items<S: StorageBackend>(
+    storage: &S,
     table_name: &str,
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
@@ -154,7 +160,9 @@ fn collect_matching_items(
             .to_key_string()
             .ok_or_else(|| DynoxideError::ValidationException("Invalid key value".to_string()))?;
 
-        let rows = storage.query_items(table_name, &pk_str, &Default::default())?;
+        let rows = storage
+            .query_items(table_name, &pk_str, &Default::default())
+            .await?;
 
         let iter = rows
             .into_iter()
@@ -167,7 +175,7 @@ fn collect_matching_items(
             iter.collect()
         }
     } else {
-        let rows = storage.scan_items(table_name, &Default::default())?;
+        let rows = storage.scan_items(table_name, &Default::default()).await?;
 
         let iter = rows
             .into_iter()
@@ -203,8 +211,8 @@ fn find_pk_condition<'a>(
     }
 }
 
-fn execute_insert(
-    storage: &Storage,
+async fn execute_insert<S: StorageBackend>(
+    storage: &S,
     table_name: &str,
     item_template: &HashMap<String, PartiqlValue>,
     parameters: &[AttributeValue],
@@ -225,7 +233,7 @@ fn execute_insert(
         item.insert(k.clone(), resolved);
     }
 
-    let meta = require_table(storage, table_name)?;
+    let meta = require_table(storage, table_name).await?;
     let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
 
     // Validate keys present
@@ -239,7 +247,7 @@ fn execute_insert(
     let (pk, sk) = crate::actions::helpers::extract_key_strings(&item, &key_schema)?;
 
     // PartiQL INSERT must reject duplicates (unlike PutItem which overwrites)
-    let existing = storage.get_item(table_name, &pk, &sk)?;
+    let existing = storage.get_item(table_name, &pk, &sk).await?;
     if existing.is_some() {
         if if_not_exists {
             // Silently succeed — no-op
@@ -258,8 +266,9 @@ fn execute_insert(
         .get(&key_schema.partition_key)
         .map(crate::storage::compute_hash_prefix)
         .unwrap_or_default();
-    let old_json =
-        storage.put_item_with_hash(table_name, &pk, &sk, &item_json, item_size, &hash_prefix)?;
+    let old_json = storage
+        .put_item_with_hash(table_name, &pk, &sk, &item_json, item_size, &hash_prefix)
+        .await?;
 
     // GSI maintenance
     let table_sk_attr = key_schema.sort_key.as_deref();
@@ -272,7 +281,8 @@ fn execute_insert(
         &item,
         &key_schema.partition_key,
         table_sk_attr,
-    )?;
+    )
+    .await?;
 
     // LSI maintenance
     crate::actions::lsi::maintain_lsis_after_write(
@@ -284,24 +294,25 @@ fn execute_insert(
         &item,
         &key_schema.partition_key,
         table_sk_attr,
-    )?;
+    )
+    .await?;
 
     // Stream record
     let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
-    crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item))?;
+    crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
 
     Ok(())
 }
 
-fn execute_update(
-    storage: &Storage,
+async fn execute_update<S: StorageBackend>(
+    storage: &S,
     table_name: &str,
     set_clauses: &[crate::partiql::parser::SetClause],
     remove_paths: &[String],
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
 ) -> Result<()> {
-    let meta = require_table(storage, table_name)?;
+    let meta = require_table(storage, table_name).await?;
     let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
 
     // WHERE clause is required for UPDATE to identify the item
@@ -347,7 +358,7 @@ fn execute_update(
     };
 
     // Get existing item
-    let existing_json = storage.get_item(table_name, &pk_str, &sk_str)?;
+    let existing_json = storage.get_item(table_name, &pk_str, &sk_str).await?;
     let mut item: Item = existing_json
         .as_ref()
         .and_then(|j| serde_json::from_str(j).ok())
@@ -383,14 +394,16 @@ fn execute_update(
         .get(&key_schema.partition_key)
         .map(crate::storage::compute_hash_prefix)
         .unwrap_or_default();
-    storage.put_item_with_hash(
-        table_name,
-        &pk_str,
-        &sk_str,
-        &item_json,
-        item_size,
-        &hash_prefix,
-    )?;
+    storage
+        .put_item_with_hash(
+            table_name,
+            &pk_str,
+            &sk_str,
+            &item_json,
+            item_size,
+            &hash_prefix,
+        )
+        .await?;
 
     // GSI maintenance
     let table_sk_attr = key_schema.sort_key.as_deref();
@@ -403,7 +416,8 @@ fn execute_update(
         &item,
         &key_schema.partition_key,
         table_sk_attr,
-    )?;
+    )
+    .await?;
 
     // LSI maintenance
     crate::actions::lsi::maintain_lsis_after_write(
@@ -415,7 +429,8 @@ fn execute_update(
         &item,
         &key_schema.partition_key,
         table_sk_attr,
-    )?;
+    )
+    .await?;
 
     // Stream record
     let old_ref = if existing_json.is_some() {
@@ -423,18 +438,18 @@ fn execute_update(
     } else {
         None
     };
-    crate::streams::record_stream_event(storage, &meta, old_ref, Some(&item))?;
+    crate::streams::record_stream_event(storage, &meta, old_ref, Some(&item)).await?;
 
     Ok(())
 }
 
-fn execute_delete(
-    storage: &Storage,
+async fn execute_delete<S: StorageBackend>(
+    storage: &S,
     table_name: &str,
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
 ) -> Result<()> {
-    let meta = require_table(storage, table_name)?;
+    let meta = require_table(storage, table_name).await?;
     let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
 
     let wc = where_clause.ok_or_else(|| {
@@ -486,20 +501,22 @@ fn execute_delete(
         String::new()
     };
 
-    let old_json = storage.delete_item(table_name, &pk_str, &sk_str)?;
+    let old_json = storage.delete_item(table_name, &pk_str, &sk_str).await?;
 
     // GSI maintenance
     let _ = crate::actions::gsi::maintain_gsis_after_delete(
         storage, table_name, &meta, &pk_str, &sk_str,
-    )?;
+    )
+    .await?;
 
     // LSI maintenance
-    crate::actions::lsi::maintain_lsis_after_delete(storage, table_name, &meta, &pk_str, &sk_str)?;
+    crate::actions::lsi::maintain_lsis_after_delete(storage, table_name, &meta, &pk_str, &sk_str)
+        .await?;
 
     // Stream record
     let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
     if old_item.is_some() {
-        crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None)?;
+        crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None).await?;
     }
 
     Ok(())
@@ -509,8 +526,11 @@ fn execute_delete(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn require_table(storage: &Storage, table_name: &str) -> Result<crate::storage::TableMetadata> {
-    crate::actions::helpers::require_table(storage, table_name)
+async fn require_table<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+) -> Result<crate::storage::TableMetadata> {
+    crate::actions::helpers::require_table(storage, table_name).await
 }
 
 /// Find a comparison condition matching a given path with Eq operator,

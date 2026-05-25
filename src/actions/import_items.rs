@@ -2,8 +2,8 @@ use crate::actions::gsi;
 use crate::actions::helpers;
 use crate::actions::lsi;
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
 use crate::storage_backend::BaseItemRow;
+use crate::storage_backend::StorageBackend;
 use crate::types::item_size;
 use crate::{ImportOptions, ImportResult};
 use std::time::SystemTime;
@@ -12,13 +12,13 @@ use std::time::SystemTime;
 ///
 /// All items are inserted in a single transaction. If any item fails,
 /// the entire import is rolled back.
-pub fn execute(
-    storage: &Storage,
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
     table_name: &str,
     items: Vec<crate::types::Item>,
     options: &ImportOptions,
 ) -> Result<ImportResult> {
-    execute_inner(storage, table_name, items, options, false)
+    execute_inner(storage, table_name, items, options, false).await
 }
 
 /// Bulk import with option to skip GSI deletes.
@@ -26,24 +26,24 @@ pub fn execute(
 /// When `skip_gsi_deletes` is true, the DELETE-before-INSERT on GSI tables
 /// is skipped entirely. The caller must guarantee there are no pre-existing
 /// rows whose GSI keys could become stale (i.e., fresh database).
-pub fn execute_skip_gsi_deletes(
-    storage: &Storage,
+pub async fn execute_skip_gsi_deletes<S: StorageBackend>(
+    storage: &S,
     table_name: &str,
     items: Vec<crate::types::Item>,
     options: &ImportOptions,
 ) -> Result<ImportResult> {
-    execute_inner(storage, table_name, items, options, true)
+    execute_inner(storage, table_name, items, options, true).await
 }
 
-fn execute_inner(
-    storage: &Storage,
+async fn execute_inner<S: StorageBackend>(
+    storage: &S,
     table_name: &str,
     items: Vec<crate::types::Item>,
     options: &ImportOptions,
     skip_gsi_deletes: bool,
 ) -> Result<ImportResult> {
     // 1. Require table exists
-    let meta = helpers::require_table(storage, table_name)?;
+    let meta = helpers::require_table(storage, table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
 
     // 2. Empty vec: no-op
@@ -60,7 +60,7 @@ fn execute_inner(
     let lsi_defs = lsi::parse_lsi_defs(&meta)?;
 
     // 4. Begin transaction
-    storage.begin_transaction()?;
+    storage.begin_transaction().await?;
 
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -74,7 +74,7 @@ fn execute_inner(
 
     // Pre-fetch the next stream sequence number once (fix: O(n) → O(1))
     let mut next_seq = if options.record_streams && meta.stream_enabled {
-        storage.next_stream_sequence_number(table_name)?
+        storage.next_stream_sequence_number(table_name).await?
     } else {
         0
     };
@@ -82,7 +82,7 @@ fn execute_inner(
     let mut total_bytes: usize = 0;
     let mut base_rows: Vec<BaseItemRow> = Vec::with_capacity(item_count);
 
-    let result = (|| -> Result<()> {
+    let result: Result<()> = async {
         for mut item in items {
             // 5. Validate required keys and extract pk/sk
             helpers::validate_item_keys(&item, &key_schema, &meta)?;
@@ -112,7 +112,9 @@ fn execute_inner(
                 // Delete any existing GSI entry for this base table key
                 // (skipped on fresh import — no stale entries to clean up)
                 if !skip_gsi_deletes {
-                    storage.delete_gsi_item(table_name, &gsi_def.index_name, &pk, &sk)?;
+                    storage
+                        .delete_gsi_item(table_name, &gsi_def.index_name, &pk, &sk)
+                        .await?;
                 }
 
                 // If item has GSI pk attribute, insert into GSI
@@ -144,15 +146,17 @@ fn execute_inner(
                             })?
                         };
 
-                    storage.insert_gsi_item(
-                        table_name,
-                        &gsi_def.index_name,
-                        &gsi_pk,
-                        &gsi_sk,
-                        &pk,
-                        &sk,
-                        &projected_json,
-                    )?;
+                    storage
+                        .insert_gsi_item(
+                            table_name,
+                            &gsi_def.index_name,
+                            &gsi_pk,
+                            &gsi_sk,
+                            &pk,
+                            &sk,
+                            &projected_json,
+                        )
+                        .await?;
                 }
             }
 
@@ -160,7 +164,9 @@ fn execute_inner(
             for lsi_def in &lsi_defs {
                 // Delete any existing LSI entry for this base table key
                 if !skip_gsi_deletes {
-                    storage.delete_lsi_item(table_name, &lsi_def.index_name, &pk, &sk)?;
+                    storage
+                        .delete_lsi_item(table_name, &lsi_def.index_name, &pk, &sk)
+                        .await?;
                 }
 
                 // If item has LSI sk attribute, insert into LSI
@@ -187,15 +193,17 @@ fn execute_inner(
                                 })?
                             };
 
-                        storage.insert_lsi_item(
-                            table_name,
-                            &lsi_def.index_name,
-                            &lsi_pk,
-                            &lsi_sk,
-                            &pk,
-                            &sk,
-                            &projected_json,
-                        )?;
+                        storage
+                            .insert_lsi_item(
+                                table_name,
+                                &lsi_def.index_name,
+                                &lsi_pk,
+                                &lsi_sk,
+                                &pk,
+                                &sk,
+                                &projected_json,
+                            )
+                            .await?;
                     }
                 }
             }
@@ -221,16 +229,18 @@ fn execute_inner(
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
                     .as_secs() as i64;
-                storage.insert_stream_record(
-                    table_name,
-                    "INSERT",
-                    &keys_json,
-                    Some(&item_json),
-                    None,
-                    &seq.to_string(),
-                    &shard_id,
-                    now_epoch,
-                )?;
+                storage
+                    .insert_stream_record(
+                        table_name,
+                        "INSERT",
+                        &keys_json,
+                        Some(&item_json),
+                        None,
+                        &seq.to_string(),
+                        &shard_id,
+                        now_epoch,
+                    )
+                    .await?;
             }
 
             // Collect the base row; all base inserts run as one batch after
@@ -244,21 +254,22 @@ fn execute_inner(
                 hash_prefix,
             });
         }
-        storage.put_base_items(table_name, &base_rows)?;
+        storage.put_base_items(table_name, &base_rows).await?;
         Ok(())
-    })();
+    }
+    .await;
 
     // 10. Commit or rollback
     match result {
         Ok(()) => {
-            storage.commit()?;
+            storage.commit().await?;
             Ok(ImportResult {
                 items_imported: item_count,
                 bytes_imported: total_bytes,
             })
         }
         Err(e) => {
-            let _ = storage.rollback();
+            let _ = storage.rollback().await;
             Err(e)
         }
     }

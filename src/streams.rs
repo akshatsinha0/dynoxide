@@ -3,7 +3,8 @@
 //! Generates stream records on write operations when streams are enabled on a table.
 
 use crate::errors::Result;
-use crate::storage::{Storage, TableMetadata};
+use crate::storage::TableMetadata;
+use crate::storage_backend::StorageBackend;
 use crate::storage_backend::clock::Clock;
 use crate::types::{AttributeValue, Item};
 use std::collections::HashMap;
@@ -65,8 +66,8 @@ pub fn extract_keys(item: &Item, key_schema_json: &str) -> HashMap<String, Attri
 /// For MODIFY: both are Some.
 /// For REMOVE: old_item is Some, new_item is None.
 #[allow(clippy::too_many_arguments)]
-pub fn record_stream_event(
-    storage: &Storage,
+pub async fn record_stream_event<S: StorageBackend>(
+    storage: &S,
     meta: &TableMetadata,
     old_item: Option<&Item>,
     new_item: Option<&Item>,
@@ -106,20 +107,24 @@ pub fn record_stream_event(
         _ => None,
     };
 
-    let seq_num = storage.next_stream_sequence_number(&meta.table_name)?;
+    let seq_num = storage
+        .next_stream_sequence_number(&meta.table_name)
+        .await?;
     let sid = shard_id(&meta.table_name);
     let now = storage.clock().now_unix_secs() as i64;
 
-    storage.insert_stream_record(
-        &meta.table_name,
-        event_name,
-        &keys_json,
-        new_image_json.as_deref(),
-        old_image_json.as_deref(),
-        &seq_num.to_string(),
-        &sid,
-        now,
-    )?;
+    storage
+        .insert_stream_record(
+            &meta.table_name,
+            event_name,
+            &keys_json,
+            new_image_json.as_deref(),
+            old_image_json.as_deref(),
+            &seq_num.to_string(),
+            &sid,
+            now,
+        )
+        .await?;
 
     Ok(())
 }

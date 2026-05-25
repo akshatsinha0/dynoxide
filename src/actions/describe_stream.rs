@@ -1,5 +1,5 @@
 use crate::errors::{DynoxideError, Result};
-use crate::storage::Storage;
+use crate::storage_backend::StorageBackend;
 use crate::streams;
 use serde::{Deserialize, Serialize};
 
@@ -59,8 +59,8 @@ pub struct SequenceNumberRange {
     pub ending_sequence_number: Option<String>,
 }
 
-pub fn execute(
-    storage: &Storage,
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
     request: DescribeStreamRequest,
 ) -> Result<DescribeStreamResponse> {
     // Parse table name from ARN
@@ -71,12 +71,15 @@ pub fn execute(
         ))
     })?;
 
-    let meta = storage.get_table_metadata(&table_name)?.ok_or_else(|| {
-        DynoxideError::ResourceNotFoundException(format!(
-            "Requested resource not found: Stream: {}",
-            request.stream_arn
-        ))
-    })?;
+    let meta = storage
+        .get_table_metadata(&table_name)
+        .await?
+        .ok_or_else(|| {
+            DynoxideError::ResourceNotFoundException(format!(
+                "Requested resource not found: Stream: {}",
+                request.stream_arn
+            ))
+        })?;
 
     if !meta.stream_enabled {
         return Err(DynoxideError::ResourceNotFoundException(format!(
@@ -87,7 +90,7 @@ pub fn execute(
 
     let label = meta.stream_label.clone().unwrap_or_default();
     let sid = streams::shard_id(&table_name);
-    let (start_seq, end_seq) = storage.get_shard_sequence_range(&table_name, &sid)?;
+    let (start_seq, end_seq) = storage.get_shard_sequence_range(&table_name, &sid).await?;
 
     Ok(DescribeStreamResponse {
         stream_description: StreamDescription {

@@ -3,7 +3,8 @@
 //! Handles keeping LSI tables in sync with base table writes.
 
 use crate::errors::{DynoxideError, Result};
-use crate::storage::{Storage, TableMetadata};
+use crate::storage::TableMetadata;
+use crate::storage_backend::StorageBackend;
 use crate::types::{Item, KeyType, LocalSecondaryIndex};
 
 /// Type alias: LSI definitions reuse the shared IndexDef from gsi.
@@ -64,8 +65,8 @@ pub fn parse_lsi_key_schema(
 /// Update all LSI tables after an item write (put/update).
 /// Handles both insert and update cases.
 #[allow(clippy::too_many_arguments)]
-pub fn maintain_lsis_after_write(
-    storage: &Storage,
+pub async fn maintain_lsis_after_write<S: StorageBackend>(
+    storage: &S,
     table_name: &str,
     meta: &TableMetadata,
     table_pk_str: &str,
@@ -78,7 +79,9 @@ pub fn maintain_lsis_after_write(
 
     for lsi in &lsi_defs {
         // First, remove any existing LSI entry for this base table key
-        storage.delete_lsi_item(table_name, &lsi.index_name, table_pk_str, table_sk_str)?;
+        storage
+            .delete_lsi_item(table_name, &lsi.index_name, table_pk_str, table_sk_str)
+            .await?;
 
         // LSI pk is always the same as the table pk. Only insert if item
         // has the LSI sort key attribute (sparse index behaviour).
@@ -92,15 +95,17 @@ pub fn maintain_lsis_after_write(
                 let item_json = serde_json::to_string(&projected)
                     .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
 
-                storage.insert_lsi_item(
-                    table_name,
-                    &lsi.index_name,
-                    &lsi_pk,
-                    &lsi_sk,
-                    table_pk_str,
-                    table_sk_str,
-                    &item_json,
-                )?;
+                storage
+                    .insert_lsi_item(
+                        table_name,
+                        &lsi.index_name,
+                        &lsi_pk,
+                        &lsi_sk,
+                        table_pk_str,
+                        table_sk_str,
+                        &item_json,
+                    )
+                    .await?;
             }
         }
     }
@@ -109,8 +114,8 @@ pub fn maintain_lsis_after_write(
 }
 
 /// Remove an item from all LSI tables after a delete.
-pub fn maintain_lsis_after_delete(
-    storage: &Storage,
+pub async fn maintain_lsis_after_delete<S: StorageBackend>(
+    storage: &S,
     table_name: &str,
     meta: &TableMetadata,
     table_pk_str: &str,
@@ -119,7 +124,9 @@ pub fn maintain_lsis_after_delete(
     let lsi_defs = parse_lsi_defs(meta)?;
 
     for lsi in &lsi_defs {
-        storage.delete_lsi_item(table_name, &lsi.index_name, table_pk_str, table_sk_str)?;
+        storage
+            .delete_lsi_item(table_name, &lsi.index_name, table_pk_str, table_sk_str)
+            .await?;
     }
 
     Ok(())
