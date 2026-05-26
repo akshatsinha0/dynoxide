@@ -6,6 +6,8 @@ use crate::types::AttributeValue;
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 use rusqlite::{Connection, params};
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+use crate::storage_backend::sql_builders::{self, escape_table_name};
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
 /// Current schema version. Stored in the `_config` table for future migrations.
@@ -367,47 +369,8 @@ impl Storage {
             },
         )?;
 
-        // Create metadata tables
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS _config (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS _tables (
-                table_name TEXT PRIMARY KEY,
-                key_schema TEXT NOT NULL,
-                attribute_definitions TEXT NOT NULL,
-                gsi_definitions TEXT,
-                lsi_definitions TEXT,
-                stream_enabled INTEGER DEFAULT 0,
-                stream_view_type TEXT,
-                stream_label TEXT,
-                ttl_attribute TEXT,
-                ttl_enabled INTEGER DEFAULT 0,
-                created_at INTEGER NOT NULL,
-                table_status TEXT NOT NULL DEFAULT 'ACTIVE',
-                billing_mode TEXT DEFAULT 'PAY_PER_REQUEST',
-                provisioned_throughput TEXT,
-                tags TEXT,
-                sse_specification TEXT,
-                table_class TEXT,
-                deletion_protection_enabled INTEGER DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS _stream_records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                table_name TEXT NOT NULL,
-                event_name TEXT NOT NULL,
-                keys_json TEXT NOT NULL,
-                new_image TEXT,
-                old_image TEXT,
-                sequence_number TEXT NOT NULL,
-                shard_id TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                user_identity TEXT
-            );",
-        )?;
+        // Create metadata tables (schema shared with the wasm backend).
+        self.conn.execute_batch(sql_builders::INIT_SCHEMA)?;
 
         // Migrate: add user_identity column if it doesn't exist (for databases created before Phase 11)
         let _ = self
@@ -599,25 +562,9 @@ impl Storage {
     /// Insert a row into the `_tables` metadata table.
     pub fn insert_table_metadata(&self, m: &CreateTableMetadata) -> Result<()> {
         let table_name = m.table_name;
-        self.conn.execute(
-            "INSERT INTO _tables (table_name, key_schema, attribute_definitions, gsi_definitions, \
-             lsi_definitions, provisioned_throughput, created_at, sse_specification, table_class, \
-             deletion_protection_enabled, billing_mode)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                m.table_name,
-                m.key_schema,
-                m.attribute_definitions,
-                m.gsi_definitions,
-                m.lsi_definitions,
-                m.provisioned_throughput,
-                m.created_at,
-                m.sse_specification,
-                m.table_class,
-                m.deletion_protection_enabled as i32,
-                m.billing_mode,
-            ],
-        )?;
+        let (sql, params) = sql_builders::insert_table_metadata(m);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         self.metadata_cache.borrow_mut().remove(table_name);
         Ok(())
     }
@@ -633,10 +580,10 @@ impl Storage {
             return Ok(Some(cached.clone()));
         }
 
-        let sql = format!("SELECT {TABLE_METADATA_COLUMNS} FROM _tables WHERE table_name = ?1");
+        let (sql, params) = sql_builders::get_table_metadata(table_name);
         let mut stmt = self.conn.prepare(&sql)?;
 
-        let result = stmt.query_row(params![table_name], row_to_metadata);
+        let result = stmt.query_row(rusqlite::params_from_iter(params.iter()), row_to_metadata);
 
         match result {
             Ok(meta) => {
@@ -652,10 +599,10 @@ impl Storage {
 
     /// Delete metadata for a table.
     pub fn delete_table_metadata(&self, table_name: &str) -> Result<bool> {
-        let affected = self.conn.execute(
-            "DELETE FROM _tables WHERE table_name = ?1",
-            params![table_name],
-        )?;
+        let (sql, params) = sql_builders::delete_table_metadata(table_name);
+        let affected = self
+            .conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         self.metadata_cache.borrow_mut().remove(table_name);
         Ok(affected > 0)
     }
@@ -796,22 +743,22 @@ impl Storage {
 
     /// List all table names.
     pub fn list_table_names(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT table_name FROM _tables ORDER BY table_name")?;
+        let (sql, params) = sql_builders::list_table_names();
+        let mut stmt = self.conn.prepare(&sql)?;
         let names = stmt
-            .query_map([], |row| row.get(0))?
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| row.get(0))?
             .collect::<std::result::Result<Vec<String>, _>>()?;
         Ok(names)
     }
 
     /// Check if a table exists in metadata.
     pub fn table_exists(&self, table_name: &str) -> Result<bool> {
-        let count: i32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM _tables WHERE table_name = ?1",
-            params![table_name],
-            |row| row.get(0),
-        )?;
+        let (sql, params) = sql_builders::table_exists(table_name);
+        let count: i32 = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                row.get(0)
+            })?;
         Ok(count > 0)
     }
 
@@ -827,26 +774,17 @@ impl Storage {
 
     /// Create a data table for a DynamoDB table.
     pub fn create_data_table(&self, table_name: &str) -> Result<()> {
-        let sql = format!(
-            "CREATE TABLE \"{}\" (
-                pk TEXT NOT NULL,
-                sk TEXT NOT NULL DEFAULT '',
-                item_json TEXT NOT NULL,
-                item_size INTEGER NOT NULL,
-                cached_at REAL,
-                hash_prefix TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (pk, sk)
-            )",
-            escape_table_name(table_name)
-        );
-        self.conn.execute(&sql, [])?;
+        let (sql, params) = sql_builders::create_data_table(table_name);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
     /// Drop a data table.
     pub fn drop_data_table(&self, table_name: &str) -> Result<()> {
-        let sql = format!("DROP TABLE IF EXISTS \"{}\"", escape_table_name(table_name));
-        self.conn.execute(&sql, [])?;
+        let (sql, params) = sql_builders::drop_data_table(table_name);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -1373,19 +1311,19 @@ impl Storage {
 
     /// Begin an immediate SQLite transaction.
     pub fn begin_transaction(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.conn.execute_batch(sql_builders::BEGIN)?;
         Ok(())
     }
 
     /// Commit the current transaction.
     pub fn commit(&self) -> Result<()> {
-        self.conn.execute_batch("COMMIT")?;
+        self.conn.execute_batch(sql_builders::COMMIT)?;
         Ok(())
     }
 
     /// Rollback the current transaction.
     pub fn rollback(&self) -> Result<()> {
-        self.conn.execute_batch("ROLLBACK")?;
+        self.conn.execute_batch(sql_builders::ROLLBACK)?;
         Ok(())
     }
 
@@ -1444,16 +1382,10 @@ impl Storage {
         // First, try to get the old item for return value
         let old_item = self.get_item(table_name, pk, sk)?;
 
-        let escaped = escape_table_name(table_name);
-        let sql = format!(
-            "INSERT OR REPLACE INTO \"{escaped}\" (pk, sk, item_json, item_size, cached_at, hash_prefix) \
-             VALUES (?1, ?2, ?3, ?4, \
-             (SELECT cached_at FROM \"{escaped}\" WHERE pk = ?1 AND sk = ?2), ?5)"
-        );
-        self.conn.execute(
-            &sql,
-            params![pk, sk, item_json, item_size as i64, hash_prefix],
-        )?;
+        let (sql, params) =
+            sql_builders::put_item_with_hash(table_name, pk, sk, item_json, item_size, hash_prefix);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
 
         Ok(old_item)
     }
@@ -1488,11 +1420,12 @@ impl Storage {
 
     /// Get a single item by primary key.
     pub fn get_item(&self, table_name: &str, pk: &str, sk: &str) -> Result<Option<String>> {
-        let sql = format!(
-            "SELECT item_json FROM \"{}\" WHERE pk = ?1 AND sk = ?2",
-            escape_table_name(table_name)
-        );
-        let result = self.conn.query_row(&sql, params![pk, sk], |row| row.get(0));
+        let (sql, params) = sql_builders::get_item(table_name, pk, sk);
+        let result = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                row.get(0)
+            });
 
         match result {
             Ok(json) => Ok(Some(json)),
@@ -1503,11 +1436,12 @@ impl Storage {
 
     /// Return the total item_size for all items sharing the given partition key.
     pub fn get_partition_size(&self, table_name: &str, pk: &str) -> Result<i64> {
-        let sql = format!(
-            "SELECT COALESCE(SUM(item_size), 0) FROM \"{}\" WHERE pk = ?1",
-            escape_table_name(table_name)
-        );
-        let size: i64 = self.conn.query_row(&sql, params![pk], |row| row.get(0))?;
+        let (sql, params) = sql_builders::get_partition_size(table_name, pk);
+        let size: i64 = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                row.get(0)
+            })?;
         Ok(size)
     }
 
@@ -1532,11 +1466,9 @@ impl Storage {
     pub fn delete_item(&self, table_name: &str, pk: &str, sk: &str) -> Result<Option<String>> {
         let old_item = self.get_item(table_name, pk, sk)?;
 
-        let sql = format!(
-            "DELETE FROM \"{}\" WHERE pk = ?1 AND sk = ?2",
-            escape_table_name(table_name)
-        );
-        self.conn.execute(&sql, params![pk, sk])?;
+        let (sql, params) = sql_builders::delete_item(table_name, pk, sk);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
 
         Ok(old_item)
     }
@@ -1688,8 +1620,12 @@ impl Storage {
 
     /// Count items in a table.
     pub fn count_items(&self, table_name: &str) -> Result<i64> {
-        let sql = format!("SELECT COUNT(*) FROM \"{}\"", escape_table_name(table_name));
-        let count: i64 = self.conn.query_row(&sql, [], |row| row.get(0))?;
+        let (sql, params) = sql_builders::count_items(table_name);
+        let count: i64 = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                row.get(0)
+            })?;
         Ok(count)
     }
 
@@ -1957,7 +1893,8 @@ impl Storage {
     /// List tables that have streams enabled.
     pub fn list_stream_enabled_tables(&self) -> Result<Vec<TableMetadata>> {
         let sql = format!(
-            "SELECT {TABLE_METADATA_COLUMNS} FROM _tables WHERE stream_enabled = 1 ORDER BY table_name"
+            "SELECT {} FROM _tables WHERE stream_enabled = 1 ORDER BY table_name",
+            sql_builders::TABLE_METADATA_COLUMNS
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
@@ -1988,7 +1925,8 @@ impl Storage {
     /// List tables that have TTL enabled.
     pub fn list_ttl_enabled_tables(&self) -> Result<Vec<TableMetadata>> {
         let sql = format!(
-            "SELECT {TABLE_METADATA_COLUMNS} FROM _tables WHERE ttl_enabled = 1 ORDER BY table_name"
+            "SELECT {} FROM _tables WHERE ttl_enabled = 1 ORDER BY table_name",
+            sql_builders::TABLE_METADATA_COLUMNS
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
@@ -2093,15 +2031,6 @@ pub struct TableInfoEntry {
     pub metadata: Option<TableMetadata>,
 }
 
-/// Escape double quotes in table names for safe SQL identifier use.
-///
-/// Used by the native SQL builders today; the wasm backend reuses it when it
-/// issues the same SQL, so it is gated to the SQL-issuing backends.
-#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
-pub(crate) fn escape_table_name(name: &str) -> String {
-    name.replace('"', "\"\"")
-}
-
 /// Metadata row from the `_tables` table.
 ///
 /// Note: The `tags` column is intentionally excluded. Tags are not on the hot
@@ -2127,13 +2056,6 @@ pub struct TableMetadata {
     pub table_class: Option<String>,
     pub deletion_protection_enabled: bool,
 }
-
-/// The standard SELECT column list for _tables queries.
-#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
-const TABLE_METADATA_COLUMNS: &str = "table_name, key_schema, attribute_definitions, gsi_definitions, \
-     lsi_definitions, stream_enabled, stream_view_type, stream_label, ttl_attribute, ttl_enabled, \
-     created_at, table_status, billing_mode, provisioned_throughput, \
-     sse_specification, table_class, deletion_protection_enabled";
 
 /// Map a row from the _tables SELECT to a TableMetadata struct.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]

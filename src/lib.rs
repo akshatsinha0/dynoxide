@@ -72,6 +72,8 @@ use web_time::Instant;
 pub use errors::{DynoxideError, Result};
 pub use storage::{DatabaseInfo, TableInfoEntry, TableMetadata, TableStats};
 pub use storage_backend::BackendError;
+#[cfg(feature = "wasm-sqlite")]
+pub use storage_backend::WasmBridgeBackend;
 pub use types::{AttributeValue, ConversionError, Item};
 
 /// Options for `Database::import_items()`.
@@ -118,6 +120,15 @@ pub type RusqliteBackend = storage::Storage;
 /// `block_on` never parks the thread.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub type NativeDatabase = Database<RusqliteBackend>;
+
+/// The wasm, asynchronous `Database` over the wa-sqlite backend.
+///
+/// Alias for [`Database`] monomorphised over [`WasmBridgeBackend`]. Unlike
+/// [`NativeDatabase`], its methods are `async fn` and never call `block_on`:
+/// the wasm backend awaits real wa-sqlite promises, and the wasm main thread
+/// must not block.
+#[cfg(feature = "wasm-sqlite")]
+pub type WasmDatabase = Database<WasmBridgeBackend>;
 
 /// The main entry point for the DynamoDB emulator.
 ///
@@ -725,6 +736,96 @@ impl Database<RusqliteBackend> {
     #[cfg(feature = "mcp-server")]
     pub(crate) fn restore_from_connection(&self, source: &rusqlite::Connection) -> Result<()> {
         self.with_storage_mut(|s| s.restore_from_connection(source))
+    }
+}
+
+/// The wasm, asynchronous facade over the wa-sqlite backend.
+///
+/// Mirrors the native facade method-for-method, but each call is `async` and
+/// awaits the shared action handler directly - there is no `block_on`, because
+/// the wasm backend's bridge calls genuinely suspend. The wasm runtime is
+/// single-threaded, so the per-call lock is contention-free.
+#[cfg(feature = "wasm-sqlite")]
+impl Database<WasmBridgeBackend> {
+    /// Open (or create) a wa-sqlite database persisted to OPFS under `name`.
+    pub async fn open(name: &str) -> Result<Self> {
+        let backend = WasmBridgeBackend::open(name)
+            .await
+            .map_err(DynoxideError::from)?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(backend)),
+            idempotency_tokens: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    /// Lock the single backend for the span of one handler call.
+    fn backend(&self) -> Result<std::sync::MutexGuard<'_, WasmBridgeBackend>> {
+        self.inner
+            .lock()
+            .map_err(|e| DynoxideError::InternalServerError(format!("Lock poisoned: {e}")))
+    }
+
+    /// Create a new DynamoDB table.
+    pub async fn create_table(
+        &self,
+        request: actions::create_table::CreateTableRequest,
+    ) -> Result<actions::create_table::CreateTableResponse> {
+        let backend = self.backend()?;
+        actions::create_table::execute(&*backend, request).await
+    }
+
+    /// Delete a DynamoDB table.
+    pub async fn delete_table(
+        &self,
+        request: actions::delete_table::DeleteTableRequest,
+    ) -> Result<actions::delete_table::DeleteTableResponse> {
+        let backend = self.backend()?;
+        actions::delete_table::execute(&*backend, request).await
+    }
+
+    /// Describe a DynamoDB table.
+    pub async fn describe_table(
+        &self,
+        request: actions::describe_table::DescribeTableRequest,
+    ) -> Result<actions::describe_table::DescribeTableResponse> {
+        let backend = self.backend()?;
+        actions::describe_table::execute(&*backend, request).await
+    }
+
+    /// List DynamoDB tables.
+    pub async fn list_tables(
+        &self,
+        request: actions::list_tables::ListTablesRequest,
+    ) -> Result<actions::list_tables::ListTablesResponse> {
+        let backend = self.backend()?;
+        actions::list_tables::execute(&*backend, request).await
+    }
+
+    /// Put an item into a DynamoDB table.
+    pub async fn put_item(
+        &self,
+        request: actions::put_item::PutItemRequest,
+    ) -> Result<actions::put_item::PutItemResponse> {
+        let backend = self.backend()?;
+        actions::put_item::execute(&*backend, request).await
+    }
+
+    /// Get an item from a DynamoDB table.
+    pub async fn get_item(
+        &self,
+        request: actions::get_item::GetItemRequest,
+    ) -> Result<actions::get_item::GetItemResponse> {
+        let backend = self.backend()?;
+        actions::get_item::execute(&*backend, request).await
+    }
+
+    /// Delete an item from a DynamoDB table.
+    pub async fn delete_item(
+        &self,
+        request: actions::delete_item::DeleteItemRequest,
+    ) -> Result<actions::delete_item::DeleteItemResponse> {
+        let backend = self.backend()?;
+        actions::delete_item::execute(&*backend, request).await
     }
 }
 

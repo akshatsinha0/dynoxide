@@ -45,6 +45,17 @@ pub enum BackendError {
     #[error("{0}")]
     Validation(String),
 
+    /// A capability the active backend does not implement (for example streams,
+    /// TTL, or the cross-item `TransactWriteItems` action on the wasm backend).
+    /// Carries a static tag so callers can distinguish which capability was
+    /// refused. Surfaces as an `InternalServerError` through
+    /// `From<BackendError> for DynoxideError`.
+    #[error("backend: operation not supported: {capability}")]
+    Unsupported {
+        /// Static identifier for the unsupported capability, e.g. `"streams"`.
+        capability: &'static str,
+    },
+
     /// Any other backend failure. Carries the original error's `Display` output.
     #[error("backend: {0}")]
     Other(String),

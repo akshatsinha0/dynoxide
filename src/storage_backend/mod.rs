@@ -2,20 +2,16 @@
 //!
 //! Defines the [`StorageBackend`] trait that decouples Dynoxide's data layer
 //! from a specific SQLite binding. The native [`rusqlite`]-backed
-//! [`Storage`](crate::storage::Storage) implements the trait. A compile-only
-//! wa-sqlite stub gated behind the `wasm-stub` feature also implements it,
-//! so trait-shape drift surfaces at type-check time rather than once a real
-//! wa-sqlite backend is wired up. Building dynoxide for a non-native target
-//! (e.g., `wasm32-unknown-unknown` itself) is not yet supported; the stub
-//! validates the trait surface, not the rest of the codebase.
+//! [`Storage`](crate::storage::Storage) implements the trait, and the
+//! `wasm-sqlite` build adds [`wasm_backend::WasmBridgeBackend`], which runs the
+//! same SQL against a JS wa-sqlite database over a wasm-bindgen bridge. Both
+//! backends issue identical SQL because they share the builders in
+//! [`sql_builders`].
 //!
-//! Today the trait is consumed monomorphically. Nothing constructs
-//! `dyn StorageBackend`, nothing awaits it at runtime in production code.
-//! `Database`, action handlers, and `DynoxideError` continue to operate
-//! against the native `Storage` type directly. The escape hatches
-//! `Storage::conn()` and `Storage::conn_mut()` are not exposed by the trait;
-//! folding them in (or migrating their callers off them) is a follow-up to
-//! the wa-sqlite work.
+//! The native build consumes the trait monomorphically through `Storage`; the
+//! wasm build consumes it through `WasmBridgeBackend`. The escape hatches
+//! `Storage::conn()` and `Storage::conn_mut()` are not exposed by the trait
+//! and remain native-only.
 //!
 //! # No `Send + Sync` super-trait
 //!
@@ -28,14 +24,15 @@
 
 pub mod clock;
 pub mod error;
+pub mod sql_builders;
 // The native rusqlite-backed `Storage` exists whenever either SQLite backend
 // feature is on (the crate refuses to build with neither), and the handlers
 // now consume `StorageBackend` through it, so the impl must track the same
 // condition rather than `native-sqlite` alone.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub mod rusqlite_impl;
-#[cfg(feature = "wasm-stub")]
-pub mod wasm_stub;
+#[cfg(feature = "wasm-sqlite")]
+pub mod wasm_backend;
 
 use crate::storage::{
     CreateTableMetadata, DatabaseInfo, QueryParams, ScanParams, StreamRecord, TableMetadata,
@@ -47,6 +44,9 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::BackendError;
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub use error::from_rusqlite;
+pub use sql_builders::SqlParam;
+#[cfg(feature = "wasm-sqlite")]
+pub use wasm_backend::WasmBridgeBackend;
 
 /// One base-table row for a bulk insert via [`StorageBackend::put_base_items`].
 ///
@@ -98,10 +98,10 @@ pub struct GsiItemRow {
 /// 3. Filesystem-typed and rusqlite-typed methods are excluded; they remain
 ///    on the native [`Storage`](crate::storage::Storage) only.
 ///
-/// The trait is not consumed dynamically today. Its job is to lock the shape
-/// a future wa-sqlite backend will satisfy; type-level fit is validated by
-/// the compile-only stub in
-/// [`wasm_stub`](crate::storage_backend::wasm_stub).
+/// The trait is not consumed dynamically today. The native
+/// [`Storage`](crate::storage::Storage) and the wasm
+/// [`WasmBridgeBackend`](wasm_backend::WasmBridgeBackend) each implement it
+/// monomorphically.
 ///
 /// The `#[allow(async_fn_in_trait)]` reflects the monomorphic-only consumption
 /// model. The lint can be revisited if and when `dyn StorageBackend` becomes

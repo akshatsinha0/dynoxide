@@ -1,0 +1,10 @@
+{
+  "name": "dynoxide-wasm",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "JS bridge for the dynoxide wasm-sqlite backend (preview). Provides the wa-sqlite glue consumed by the Rust wasm-bindgen backend; the browser test harness is added separately.",
+  "devDependencies": {
+    "wa-sqlite": "^1.0.0"
+  }
+}
