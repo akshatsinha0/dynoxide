@@ -428,11 +428,13 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn scan_gsi_items(
         &self,
-        _table_name: &str,
-        _index_name: &str,
-        _params: &ScanParams<'_>,
+        table_name: &str,
+        index_name: &str,
+        params: &ScanParams<'_>,
     ) -> Result<Vec<(String, String, String)>, BackendError> {
-        Err(not_yet("scan_gsi_items"))
+        let (sql, p) = sql_builders::scan_gsi_items(table_name, index_name, params);
+        let rows = self.query(&sql, p).await?;
+        Ok(rows_to_triples(&rows))
     }
 
     // --- LSI items -------------------------------------------------------
@@ -478,11 +480,13 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn scan_lsi_items(
         &self,
-        _table_name: &str,
-        _index_name: &str,
-        _params: &ScanParams<'_>,
+        table_name: &str,
+        index_name: &str,
+        params: &ScanParams<'_>,
     ) -> Result<Vec<(String, String, String)>, BackendError> {
-        Err(not_yet("scan_lsi_items"))
+        let (sql, p) = sql_builders::scan_lsi_items(table_name, index_name, params);
+        let rows = self.query(&sql, p).await?;
+        Ok(rows_to_triples(&rows))
     }
 
     // --- Transactions ----------------------------------------------------
@@ -608,10 +612,12 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn scan_items(
         &self,
-        _table_name: &str,
-        _params: &ScanParams<'_>,
+        table_name: &str,
+        params: &ScanParams<'_>,
     ) -> Result<Vec<(String, String, String)>, BackendError> {
-        Err(not_yet("scan_items"))
+        let (sql, p) = sql_builders::scan_items(table_name, params);
+        let rows = self.query(&sql, p).await?;
+        Ok(rows_to_triples(&rows))
     }
 
     async fn count_items(&self, table_name: &str) -> Result<i64, BackendError> {

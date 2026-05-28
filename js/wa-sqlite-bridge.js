@@ -47,6 +47,30 @@ async function moduleHandle() {
 export async function open(name) {
   const s = await moduleHandle();
   const db = await s.open_v2(name);
+
+  // Register fnv1a_hash for GSI/LSI parallel-scan segment filtering, matching
+  // the native scalar function: FNV-1a (32-bit) over the value's UTF-8 bytes,
+  // returned as an integer so `fnv1a_hash(col) % total` is integer modulo.
+  s.create_function(
+    db,
+    "fnv1a_hash",
+    1,
+    SQLite.SQLITE_UTF8,
+    0,
+    (context, values) => {
+      const text = s.value(values[0]);
+      const bytes = new TextEncoder().encode(typeof text === "string" ? text : "");
+      let hash = 0x811c9dc5;
+      for (const b of bytes) {
+        hash ^= b;
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+      }
+      s.result(context, BigInt(hash >>> 0));
+    },
+    null,
+    null,
+  );
+
   return { db };
 }
 

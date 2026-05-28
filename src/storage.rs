@@ -16,7 +16,7 @@ const SCHEMA_VERSION: &str = "6";
 
 /// Number of hash buckets used for parallel scan segment assignment.
 /// Matches dynalite's implementation.
-const HASH_BUCKETS: u32 = 4096;
+pub(crate) const HASH_BUCKETS: u32 = 4096;
 
 // ---------------------------------------------------------------------------
 // MD5-based hash prefix for parallel scan (dynalite-compatible)
@@ -187,7 +187,7 @@ pub fn hash_in_segment(hash_prefix: &str, segment: u32, total_segments: u32) -> 
     bucket >= start && bucket <= end
 }
 
-fn ceiling_div(a: u32, b: u32) -> u32 {
+pub(crate) fn ceiling_div(a: u32, b: u32) -> u32 {
     a.div_ceil(b)
 }
 
@@ -894,77 +894,10 @@ impl Storage {
         index_name: &str,
         params: &ScanParams,
     ) -> Result<Vec<(String, String, String)>> {
-        let gsi_table_name = format!("{table_name}::gsi::{index_name}");
-        let mut sql = format!(
-            "SELECT gsi_pk, gsi_sk, item_json FROM \"{}\"",
-            escape_table_name(&gsi_table_name)
-        );
-
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut where_clauses = Vec::new();
-        let mut param_idx = 1;
-
-        if let (Some(start_pk), Some(start_sk)) =
-            (params.exclusive_start_pk, params.exclusive_start_sk)
-        {
-            // The GSI table's primary key is (gsi_pk, gsi_sk, table_pk, table_sk).
-            // Using only (gsi_pk, gsi_sk) for the cursor skips rows that share the
-            // same GSI key but have different base table keys.
-            if let (Some(base_pk), Some(base_sk)) = (
-                params.exclusive_start_base_pk,
-                params.exclusive_start_base_sk,
-            ) {
-                where_clauses.push(format!(
-                    "(gsi_pk, gsi_sk, table_pk, table_sk) > (?{}, ?{}, ?{}, ?{})",
-                    param_idx,
-                    param_idx + 1,
-                    param_idx + 2,
-                    param_idx + 3
-                ));
-                params_vec.push(Box::new(start_pk.to_string()));
-                params_vec.push(Box::new(start_sk.to_string()));
-                params_vec.push(Box::new(base_pk.to_string()));
-                params_vec.push(Box::new(base_sk.to_string()));
-                param_idx += 4;
-            } else {
-                where_clauses.push(format!(
-                    "(gsi_pk, gsi_sk) > (?{}, ?{})",
-                    param_idx,
-                    param_idx + 1
-                ));
-                params_vec.push(Box::new(start_pk.to_string()));
-                params_vec.push(Box::new(start_sk.to_string()));
-                param_idx += 2;
-            }
-        }
-
-        // For GSI parallel scan, hash on the base table pk (table_pk column)
-        if let (Some(seg), Some(total)) = (params.segment, params.total_segments) {
-            where_clauses.push(format!(
-                "(fnv1a_hash(table_pk) % ?{}) = ?{}",
-                param_idx,
-                param_idx + 1
-            ));
-            params_vec.push(Box::new(total as i64));
-            params_vec.push(Box::new(seg as i64));
-        }
-
-        if !where_clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_clauses.join(" AND "));
-        }
-
-        sql.push_str(" ORDER BY gsi_pk ASC, gsi_sk ASC, table_pk ASC, table_sk ASC");
-
-        if let Some(lim) = params.limit {
-            sql.push_str(&format!(" LIMIT {lim}"));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
+        let (sql, params_vec) = sql_builders::scan_gsi_items(table_name, index_name, params);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
+            .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1058,77 +991,10 @@ impl Storage {
         index_name: &str,
         params: &ScanParams,
     ) -> Result<Vec<(String, String, String)>> {
-        let lsi_table_name = format!("{table_name}::lsi::{index_name}");
-        let mut sql = format!(
-            "SELECT pk, sk, item_json FROM \"{}\"",
-            escape_table_name(&lsi_table_name)
-        );
-
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut where_clauses = Vec::new();
-        let mut param_idx = 1;
-
-        // Use composite cursor when base key values are present for correct LSI pagination.
-        if let (Some(start_pk), Some(start_sk), Some(start_base_pk), Some(start_base_sk)) = (
-            params.exclusive_start_pk,
-            params.exclusive_start_sk,
-            params.exclusive_start_base_pk,
-            params.exclusive_start_base_sk,
-        ) {
-            where_clauses.push(format!(
-                "(pk, sk, base_pk, base_sk) > (?{}, ?{}, ?{}, ?{})",
-                param_idx,
-                param_idx + 1,
-                param_idx + 2,
-                param_idx + 3
-            ));
-            params_vec.push(Box::new(start_pk.to_string()));
-            params_vec.push(Box::new(start_sk.to_string()));
-            params_vec.push(Box::new(start_base_pk.to_string()));
-            params_vec.push(Box::new(start_base_sk.to_string()));
-            param_idx += 4;
-        } else if let (Some(start_pk), Some(start_sk)) =
-            (params.exclusive_start_pk, params.exclusive_start_sk)
-        {
-            where_clauses.push(format!("(pk, sk) > (?{}, ?{})", param_idx, param_idx + 1));
-            params_vec.push(Box::new(start_pk.to_string()));
-            params_vec.push(Box::new(start_sk.to_string()));
-            param_idx += 2;
-        }
-
-        // For LSI parallel scan, hash on the base table pk (base_pk column)
-        if let (Some(seg), Some(total)) = (params.segment, params.total_segments) {
-            where_clauses.push(format!(
-                "(fnv1a_hash(base_pk) % ?{}) = ?{}",
-                param_idx,
-                param_idx + 1
-            ));
-            params_vec.push(Box::new(total as i64));
-            params_vec.push(Box::new(seg as i64));
-        }
-
-        if !where_clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_clauses.join(" AND "));
-        }
-
-        // Order by the full composite key so the scan order matches the
-        // `(pk, sk, base_pk, base_sk)` pagination cursor above. Without the
-        // base-key columns here, rows tied on (pk, sk) would only be ordered
-        // deterministically by the primary-key b-tree as an implementation
-        // accident; making it explicit mirrors `scan_gsi_items` and keeps the
-        // cursor/order invariant from depending on the query planner.
-        sql.push_str(" ORDER BY pk ASC, sk ASC, base_pk ASC, base_sk ASC");
-
-        if let Some(lim) = params.limit {
-            sql.push_str(&format!(" LIMIT {lim}"));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
+        let (sql, params_vec) = sql_builders::scan_lsi_items(table_name, index_name, params);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
+            .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1334,77 +1200,10 @@ impl Storage {
         table_name: &str,
         params: &ScanParams,
     ) -> Result<Vec<(String, String, String)>> {
-        let mut sql = format!(
-            "SELECT pk, sk, item_json FROM \"{}\"",
-            escape_table_name(table_name)
-        );
-
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut where_clauses = Vec::new();
-        let mut param_idx = 1;
-
-        // For parallel scan with hash_prefix-based segment filtering
-        let is_parallel = params.segment.is_some() && params.total_segments.is_some();
-
-        if let (Some(start_pk), Some(start_sk)) =
-            (params.exclusive_start_pk, params.exclusive_start_sk)
-        {
-            if is_parallel {
-                // For parallel scans, pagination must respect hash_prefix ordering
-                where_clauses.push(format!(
-                    "(hash_prefix, pk, sk) > ((SELECT hash_prefix FROM \"{}\" WHERE pk = ?{} AND sk = ?{} LIMIT 1), ?{}, ?{})",
-                    escape_table_name(table_name),
-                    param_idx, param_idx + 1,
-                    param_idx, param_idx + 1
-                ));
-            } else {
-                where_clauses.push(format!("(pk, sk) > (?{}, ?{})", param_idx, param_idx + 1));
-            }
-            params_vec.push(Box::new(start_pk.to_string()));
-            params_vec.push(Box::new(start_sk.to_string()));
-            param_idx += 2;
-        }
-
-        if let (Some(seg), Some(total)) = (params.segment, params.total_segments) {
-            // Use hash_prefix column for segment assignment.
-            // Bucket = parseInt(hash_prefix[0..3], 16).
-            // Segment owns buckets from ceil(4096*seg/total) to ceil(4096*(seg+1)/total)-1.
-            let start_bucket = ceiling_div(HASH_BUCKETS * seg, total);
-            let end_bucket = ceiling_div(HASH_BUCKETS * (seg + 1), total) - 1;
-            let start_hex = format!("{:03x}", start_bucket);
-            let end_hex = format!("{:03x}", end_bucket);
-            // hash_prefix is a 6-char hex string; compare the first 3 chars
-            where_clauses.push(format!(
-                "substr(hash_prefix, 1, 3) >= ?{} AND substr(hash_prefix, 1, 3) <= ?{}",
-                param_idx,
-                param_idx + 1
-            ));
-            params_vec.push(Box::new(start_hex));
-            params_vec.push(Box::new(end_hex));
-        }
-
-        if !where_clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_clauses.join(" AND "));
-        }
-
-        // For parallel scans, order by hash_prefix for dynalite-compatible behaviour.
-        // For regular scans, use pk/sk ordering.
-        if is_parallel {
-            sql.push_str(" ORDER BY hash_prefix ASC, pk ASC, sk ASC");
-        } else {
-            sql.push_str(" ORDER BY pk ASC, sk ASC");
-        }
-
-        if let Some(lim) = params.limit {
-            sql.push_str(&format!(" LIMIT {lim}"));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
+        let (sql, params_vec) = sql_builders::scan_items(table_name, params);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
+            .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

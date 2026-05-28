@@ -13,7 +13,7 @@
 //! identifier) via [`escape_table_name`] and bind values positionally with
 //! `?N` placeholders.
 
-use crate::storage::{CreateTableMetadata, QueryParams};
+use crate::storage::{CreateTableMetadata, HASH_BUCKETS, QueryParams, ScanParams, ceiling_div};
 
 /// One bound SQL parameter, covering the SQLite value universe and nothing
 /// more.
@@ -615,6 +615,207 @@ pub fn query_lsi_items(
     } else {
         " ORDER BY sk DESC, base_pk DESC, base_sk DESC"
     });
+
+    if let Some(lim) = params.limit {
+        sql.push_str(&format!(" LIMIT {lim}"));
+    }
+
+    (sql, out)
+}
+
+// --- Scans (pagination + parallel segments) -----------------------------
+
+/// Scan base-table items. Parallel scans (segment + total) filter and order by
+/// the stored `hash_prefix` column for dynalite-compatible behaviour; plain
+/// scans order by `(pk, sk)`.
+pub fn scan_items(table_name: &str, params: &ScanParams) -> (String, Vec<SqlParam>) {
+    let escaped = escape_table_name(table_name);
+    let mut sql = format!("SELECT pk, sk, item_json FROM \"{escaped}\"");
+    let mut out: Vec<SqlParam> = Vec::new();
+    let mut where_clauses: Vec<String> = Vec::new();
+    let mut param_idx = 1;
+
+    let is_parallel = params.segment.is_some() && params.total_segments.is_some();
+
+    if let (Some(start_pk), Some(start_sk)) =
+        (params.exclusive_start_pk, params.exclusive_start_sk)
+    {
+        if is_parallel {
+            where_clauses.push(format!(
+                "(hash_prefix, pk, sk) > ((SELECT hash_prefix FROM \"{escaped}\" WHERE pk = ?{} AND sk = ?{} LIMIT 1), ?{}, ?{})",
+                param_idx,
+                param_idx + 1,
+                param_idx,
+                param_idx + 1
+            ));
+        } else {
+            where_clauses.push(format!("(pk, sk) > (?{}, ?{})", param_idx, param_idx + 1));
+        }
+        out.push(SqlParam::text(start_pk));
+        out.push(SqlParam::text(start_sk));
+        param_idx += 2;
+    }
+
+    if let (Some(seg), Some(total)) = (params.segment, params.total_segments) {
+        let start_bucket = ceiling_div(HASH_BUCKETS * seg, total);
+        let end_bucket = ceiling_div(HASH_BUCKETS * (seg + 1), total) - 1;
+        where_clauses.push(format!(
+            "substr(hash_prefix, 1, 3) >= ?{} AND substr(hash_prefix, 1, 3) <= ?{}",
+            param_idx,
+            param_idx + 1
+        ));
+        out.push(SqlParam::Text(format!("{start_bucket:03x}")));
+        out.push(SqlParam::Text(format!("{end_bucket:03x}")));
+    }
+
+    if !where_clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clauses.join(" AND "));
+    }
+
+    if is_parallel {
+        sql.push_str(" ORDER BY hash_prefix ASC, pk ASC, sk ASC");
+    } else {
+        sql.push_str(" ORDER BY pk ASC, sk ASC");
+    }
+
+    if let Some(lim) = params.limit {
+        sql.push_str(&format!(" LIMIT {lim}"));
+    }
+
+    (sql, out)
+}
+
+/// Scan a GSI. Parallel scans hash the base-table key in SQL via
+/// `fnv1a_hash(table_pk)` (GSI tables carry no stored hash_prefix).
+pub fn scan_gsi_items(
+    table_name: &str,
+    index_name: &str,
+    params: &ScanParams,
+) -> (String, Vec<SqlParam>) {
+    let gsi = format!("{table_name}::gsi::{index_name}");
+    let mut sql = format!(
+        "SELECT gsi_pk, gsi_sk, item_json FROM \"{}\"",
+        escape_table_name(&gsi)
+    );
+    let mut out: Vec<SqlParam> = Vec::new();
+    let mut where_clauses: Vec<String> = Vec::new();
+    let mut param_idx = 1;
+
+    if let (Some(start_pk), Some(start_sk)) =
+        (params.exclusive_start_pk, params.exclusive_start_sk)
+    {
+        if let (Some(base_pk), Some(base_sk)) = (
+            params.exclusive_start_base_pk,
+            params.exclusive_start_base_sk,
+        ) {
+            where_clauses.push(format!(
+                "(gsi_pk, gsi_sk, table_pk, table_sk) > (?{}, ?{}, ?{}, ?{})",
+                param_idx,
+                param_idx + 1,
+                param_idx + 2,
+                param_idx + 3
+            ));
+            out.push(SqlParam::text(start_pk));
+            out.push(SqlParam::text(start_sk));
+            out.push(SqlParam::text(base_pk));
+            out.push(SqlParam::text(base_sk));
+            param_idx += 4;
+        } else {
+            where_clauses.push(format!(
+                "(gsi_pk, gsi_sk) > (?{}, ?{})",
+                param_idx,
+                param_idx + 1
+            ));
+            out.push(SqlParam::text(start_pk));
+            out.push(SqlParam::text(start_sk));
+            param_idx += 2;
+        }
+    }
+
+    if let (Some(seg), Some(total)) = (params.segment, params.total_segments) {
+        where_clauses.push(format!(
+            "(fnv1a_hash(table_pk) % ?{}) = ?{}",
+            param_idx,
+            param_idx + 1
+        ));
+        out.push(SqlParam::Integer(total as i64));
+        out.push(SqlParam::Integer(seg as i64));
+    }
+
+    if !where_clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clauses.join(" AND "));
+    }
+
+    sql.push_str(" ORDER BY gsi_pk ASC, gsi_sk ASC, table_pk ASC, table_sk ASC");
+
+    if let Some(lim) = params.limit {
+        sql.push_str(&format!(" LIMIT {lim}"));
+    }
+
+    (sql, out)
+}
+
+/// Scan an LSI. Parallel scans hash the base-table key in SQL via
+/// `fnv1a_hash(base_pk)`.
+pub fn scan_lsi_items(
+    table_name: &str,
+    index_name: &str,
+    params: &ScanParams,
+) -> (String, Vec<SqlParam>) {
+    let lsi = format!("{table_name}::lsi::{index_name}");
+    let mut sql = format!(
+        "SELECT pk, sk, item_json FROM \"{}\"",
+        escape_table_name(&lsi)
+    );
+    let mut out: Vec<SqlParam> = Vec::new();
+    let mut where_clauses: Vec<String> = Vec::new();
+    let mut param_idx = 1;
+
+    if let (Some(start_pk), Some(start_sk), Some(start_base_pk), Some(start_base_sk)) = (
+        params.exclusive_start_pk,
+        params.exclusive_start_sk,
+        params.exclusive_start_base_pk,
+        params.exclusive_start_base_sk,
+    ) {
+        where_clauses.push(format!(
+            "(pk, sk, base_pk, base_sk) > (?{}, ?{}, ?{}, ?{})",
+            param_idx,
+            param_idx + 1,
+            param_idx + 2,
+            param_idx + 3
+        ));
+        out.push(SqlParam::text(start_pk));
+        out.push(SqlParam::text(start_sk));
+        out.push(SqlParam::text(start_base_pk));
+        out.push(SqlParam::text(start_base_sk));
+        param_idx += 4;
+    } else if let (Some(start_pk), Some(start_sk)) =
+        (params.exclusive_start_pk, params.exclusive_start_sk)
+    {
+        where_clauses.push(format!("(pk, sk) > (?{}, ?{})", param_idx, param_idx + 1));
+        out.push(SqlParam::text(start_pk));
+        out.push(SqlParam::text(start_sk));
+        param_idx += 2;
+    }
+
+    if let (Some(seg), Some(total)) = (params.segment, params.total_segments) {
+        where_clauses.push(format!(
+            "(fnv1a_hash(base_pk) % ?{}) = ?{}",
+            param_idx,
+            param_idx + 1
+        ));
+        out.push(SqlParam::Integer(total as i64));
+        out.push(SqlParam::Integer(seg as i64));
+    }
+
+    if !where_clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clauses.join(" AND "));
+    }
+
+    sql.push_str(" ORDER BY pk ASC, sk ASC, base_pk ASC, base_sk ASC");
 
     if let Some(lim) = params.limit {
         sql.push_str(&format!(" LIMIT {lim}"));
