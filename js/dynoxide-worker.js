@@ -11,7 +11,7 @@
  * follow-on JS API layer.
  */
 
-import init, { smoke_test } from "/pkg/dynoxide.js";
+import init, { smoke_test, index_scan_test } from "/pkg/dynoxide.js";
 
 let ready = null;
 function ensureInit() {
@@ -27,6 +27,9 @@ self.onmessage = async (event) => {
     switch (op) {
       case "smoke":
         result = await smoke_test();
+        break;
+      case "index":
+        result = await index_scan_test();
         break;
       default:
         throw new Error(`unknown op: ${op}`);

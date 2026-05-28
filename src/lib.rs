@@ -829,6 +829,24 @@ impl Database<WasmBridgeBackend> {
         let backend = self.backend()?;
         actions::delete_item::execute(&*backend, request).await
     }
+
+    /// Query a DynamoDB table or secondary index.
+    pub async fn query(
+        &self,
+        request: actions::query::QueryRequest,
+    ) -> Result<actions::query::QueryResponse> {
+        let backend = self.backend()?;
+        actions::query::execute(&*backend, request).await
+    }
+
+    /// Scan a DynamoDB table or secondary index.
+    pub async fn scan(
+        &self,
+        request: actions::scan::ScanRequest,
+    ) -> Result<actions::scan::ScanResponse> {
+        let backend = self.backend()?;
+        actions::scan::execute(&*backend, request).await
+    }
 }
 
 #[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]

@@ -12,6 +12,8 @@ use wasm_bindgen::prelude::*;
 
 use crate::WasmDatabase;
 use crate::actions;
+use crate::storage::{CreateTableMetadata, QueryParams, ScanParams};
+use crate::storage_backend::{StorageBackend, WasmBridgeBackend};
 use crate::types::{
     AttributeDefinition, AttributeValue, KeySchemaElement, KeyType, ScalarAttributeType,
 };
@@ -27,6 +29,13 @@ pub async fn smoke_test() -> Result<JsValue, JsValue> {
 
 async fn run() -> crate::Result<String> {
     let db = WasmDatabase::open("dynoxide-smoke.db").await?;
+
+    // OPFS persists across runs, so clear any table left by a prior run.
+    let _ = db
+        .delete_table(actions::delete_table::DeleteTableRequest {
+            table_name: "SmokeTable".to_string(),
+        })
+        .await;
 
     db.create_table(actions::create_table::CreateTableRequest {
         table_name: "SmokeTable".to_string(),
@@ -80,5 +89,110 @@ async fn run() -> crate::Result<String> {
         "{{\"created\":true,\"put\":true,\"got_msg\":\"{}\",\"table_count\":{}}}",
         fetched,
         tables.table_names.len()
+    ))
+}
+
+/// Backend-level index/scan round-trip: exercises GSI write, query, and
+/// parallel scan (which drives `fnv1a_hash`) directly through
+/// [`WasmBridgeBackend`] on a separate OPFS database. The two scan segments
+/// must together cover every GSI row exactly once.
+#[wasm_bindgen]
+pub async fn index_scan_test() -> Result<JsValue, JsValue> {
+    run_index()
+        .await
+        .map(|s| JsValue::from_str(&s))
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+async fn run_index() -> std::result::Result<String, String> {
+    let be = WasmBridgeBackend::open("dynoxide-index.db")
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // OPFS persists across runs, so drop anything left by a prior run.
+    let _ = be.drop_gsi_table("IdxT", "gsi1").await;
+    let _ = be.drop_data_table("IdxT").await;
+    let _ = be.delete_table_metadata("IdxT").await;
+
+    be.insert_table_metadata(&CreateTableMetadata {
+        table_name: "IdxT",
+        key_schema: "[]",
+        attribute_definitions: "[]",
+        created_at: 0,
+        ..Default::default()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    be.create_data_table("IdxT")
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let keys = [("a", "1"), ("b", "1"), ("c", "1"), ("d", "1")];
+    for (pk, sk) in keys {
+        be.put_item("IdxT", pk, sk, &format!("{{\"pk\":\"{pk}\"}}"), 10)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let base_scan = be
+        .scan_items("IdxT", &ScanParams::default())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    be.create_gsi_table("IdxT", "gsi1")
+        .await
+        .map_err(|e| e.to_string())?;
+    for (pk, sk) in keys {
+        be.insert_gsi_item("IdxT", "gsi1", "G", sk, pk, sk, &format!("{{\"pk\":\"{pk}\"}}"))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let gsi_query = be
+        .query_gsi_items(
+            "IdxT",
+            "gsi1",
+            "G",
+            &QueryParams {
+                forward: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Two-segment parallel scan exercises fnv1a_hash; the union covers all rows.
+    let seg0 = be
+        .scan_gsi_items(
+            "IdxT",
+            "gsi1",
+            &ScanParams {
+                segment: Some(0),
+                total_segments: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let seg1 = be
+        .scan_gsi_items(
+            "IdxT",
+            "gsi1",
+            &ScanParams {
+                segment: Some(1),
+                total_segments: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(format!(
+        "{{\"base_scan\":{},\"gsi_query\":{},\"seg0\":{},\"seg1\":{},\"seg_union\":{}}}",
+        base_scan.len(),
+        gsi_query.len(),
+        seg0.len(),
+        seg1.len(),
+        seg0.len() + seg1.len()
     ))
 }
