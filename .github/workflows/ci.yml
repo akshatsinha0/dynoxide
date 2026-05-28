@@ -93,6 +93,11 @@ jobs:
       - name: cargo check (wasm32, wasm-sqlite)
         run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm-sqlite --lib
 
+      # The harness exercises WasmDatabase and the action types directly, so it
+      # catches trait or re-export drift the wasm-sqlite check alone misses.
+      - name: cargo check (wasm32, wasm-harness)
+        run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm-harness --lib
+
   # Gate the Docker smoke test on the paths that can actually break the
   # documented MCP-in-Docker recipe. src/main.rs carries the ServeArgs/McpArgs
   # flag plumbing and Cargo.{toml,lock} the feature set / rmcp version — both can
