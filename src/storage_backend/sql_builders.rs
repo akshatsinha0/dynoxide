@@ -903,7 +903,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let params = vec![
+        let params = [
             SqlParam::text("hello"),
             SqlParam::Integer(-9),
             SqlParam::Real(1.5),
@@ -1030,9 +1030,10 @@ mod tests {
 
     #[test]
     fn scan_items_parallel_segment_filters_by_hash_bucket() {
+        let (seg, total) = (1u32, 4u32);
         let params = ScanParams {
-            segment: Some(1),
-            total_segments: Some(4),
+            segment: Some(seg),
+            total_segments: Some(total),
             ..Default::default()
         };
         let (sql, out) = scan_items("T", &params);
@@ -1040,8 +1041,8 @@ mod tests {
             sql,
             "SELECT pk, sk, item_json FROM \"T\" WHERE substr(hash_prefix, 1, 3) >= ?1 AND substr(hash_prefix, 1, 3) <= ?2 ORDER BY hash_prefix ASC, pk ASC, sk ASC"
         );
-        let start = ceiling_div(HASH_BUCKETS * 1, 4);
-        let end = ceiling_div(HASH_BUCKETS * 2, 4) - 1;
+        let start = ceiling_div(HASH_BUCKETS * seg, total);
+        let end = ceiling_div(HASH_BUCKETS * (seg + 1), total) - 1;
         assert_eq!(
             out,
             vec![
@@ -1053,11 +1054,12 @@ mod tests {
 
     #[test]
     fn scan_items_parallel_with_cursor_uses_hash_prefix_subquery() {
+        let (seg, total) = (0u32, 2u32);
         let params = ScanParams {
             exclusive_start_pk: Some("p"),
             exclusive_start_sk: Some("s"),
-            segment: Some(0),
-            total_segments: Some(2),
+            segment: Some(seg),
+            total_segments: Some(total),
             ..Default::default()
         };
         let (sql, out) = scan_items("T", &params);
@@ -1065,8 +1067,8 @@ mod tests {
             sql,
             "SELECT pk, sk, item_json FROM \"T\" WHERE (hash_prefix, pk, sk) > ((SELECT hash_prefix FROM \"T\" WHERE pk = ?1 AND sk = ?2 LIMIT 1), ?1, ?2) AND substr(hash_prefix, 1, 3) >= ?3 AND substr(hash_prefix, 1, 3) <= ?4 ORDER BY hash_prefix ASC, pk ASC, sk ASC"
         );
-        let start = ceiling_div(HASH_BUCKETS * 0, 2);
-        let end = ceiling_div(HASH_BUCKETS * 1, 2) - 1;
+        let start = ceiling_div(HASH_BUCKETS * seg, total);
+        let end = ceiling_div(HASH_BUCKETS * (seg + 1), total) - 1;
         assert_eq!(
             out,
             vec![
