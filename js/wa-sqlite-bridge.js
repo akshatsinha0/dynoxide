@@ -27,26 +27,36 @@ import * as SQLite from "wa-sqlite";
 import SQLiteESMFactory from "wa-sqlite/dist/wa-sqlite.mjs";
 import { AccessHandlePoolVFS } from "wa-sqlite/src/examples/AccessHandlePoolVFS.js";
 
-// Lazily initialised SQLite API handle, shared across opens.
-let sqlite3 = null;
+// Lazily initialised SQLite API handle, shared across opens. We memoise the
+// in-flight promise rather than the resolved value, so two concurrent first
+// callers share one initialisation and the VFS is registered exactly once. On
+// failure we clear it so a later call can retry rather than caching the error.
+let sqlite3Promise = null;
 
-async function moduleHandle() {
-  if (sqlite3) return sqlite3;
-  // Locate wa-sqlite's .wasm next to this module at runtime. After bundling,
-  // import.meta.url is the bundle's URL, so the .wasm resolves as a sibling
-  // asset in dist/.
-  const module = await SQLiteESMFactory({
-    locateFile: (file) => new URL(file, import.meta.url).href,
-  });
-  sqlite3 = SQLite.Factory(module);
+function moduleHandle() {
+  if (!sqlite3Promise) {
+    sqlite3Promise = (async () => {
+      // Locate wa-sqlite's .wasm next to this module at runtime. After
+      // bundling, import.meta.url is the bundle's URL, so the .wasm resolves as
+      // a sibling asset in dist/.
+      const module = await SQLiteESMFactory({
+        locateFile: (file) => new URL(file, import.meta.url).href,
+      });
+      const s = SQLite.Factory(module);
 
-  // Synchronous OPFS VFS (Worker-only). It keeps its pool of access handles in
-  // one OPFS directory; `isReady` resolves once that pool is acquired.
-  // Registered as the default so open_v2 uses it.
-  const vfs = new AccessHandlePoolVFS("/dynoxide");
-  await vfs.isReady;
-  sqlite3.vfs_register(vfs, true);
-  return sqlite3;
+      // Synchronous OPFS VFS (Worker-only). It keeps its pool of access handles
+      // in one OPFS directory; `isReady` resolves once that pool is acquired.
+      // Registered as the default so open_v2 uses it.
+      const vfs = new AccessHandlePoolVFS("/dynoxide");
+      await vfs.isReady;
+      s.vfs_register(vfs, true);
+      return s;
+    })().catch((err) => {
+      sqlite3Promise = null;
+      throw err;
+    });
+  }
+  return sqlite3Promise;
 }
 
 /**
@@ -88,9 +98,15 @@ export async function open(name) {
  * `params` is a positional array binding `?1`, `?2`, ... in order.
  */
 export async function exec(handle, sql, params) {
-  const s = sqlite3;
+  const s = await moduleHandle();
+  // Positional params bind to the first statement only. Every parameterised
+  // builder emits a single statement; multi-statement batches (schema and index
+  // DDL) pass no params. Guarding on the first statement avoids silently
+  // re-binding the same array to later statements in a batch.
+  let first = true;
   for await (const stmt of s.statements(handle.db, sql)) {
-    if (params && params.length) s.bind_collection(stmt, params);
+    if (first && params && params.length) s.bind_collection(stmt, params);
+    first = false;
     while ((await s.step(stmt)) === SQLite.SQLITE_ROW) {
       // exec consumes no rows
     }
@@ -102,10 +118,13 @@ export async function exec(handle, sql, params) {
  * Each row is an array of column values in SELECT order.
  */
 export async function query(handle, sql, params) {
-  const s = sqlite3;
+  const s = await moduleHandle();
   const rows = [];
+  // Params bind to the first statement only; see exec for the rationale.
+  let first = true;
   for await (const stmt of s.statements(handle.db, sql)) {
-    if (params && params.length) s.bind_collection(stmt, params);
+    if (first && params && params.length) s.bind_collection(stmt, params);
+    first = false;
     while ((await s.step(stmt)) === SQLite.SQLITE_ROW) {
       rows.push(s.row(stmt));
     }

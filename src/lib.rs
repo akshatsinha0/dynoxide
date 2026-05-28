@@ -160,17 +160,34 @@ pub struct Database<S = RusqliteBackend> {
     idempotency_tokens: Arc<Mutex<TokenCache>>,
 }
 
+/// Serialises backend access on the backend-neutral build. On wasm this is an
+/// async mutex: the bridge calls genuinely suspend, so a std mutex held across
+/// them would deadlock concurrent callers on the single-threaded runtime,
+/// whereas an async mutex queues them. Off wasm (the degenerate no-backend
+/// shell, which can never construct a `Database`) a std mutex stands in.
+#[cfg(all(
+    not(any(feature = "native-sqlite", feature = "_has-encryption")),
+    feature = "wasm-sqlite"
+))]
+use async_lock::Mutex as BackendMutex;
+#[cfg(all(
+    not(any(feature = "native-sqlite", feature = "_has-encryption")),
+    not(feature = "wasm-sqlite")
+))]
+use std::sync::Mutex as BackendMutex;
+
 /// The main entry point for the DynamoDB emulator (backend-neutral build).
 ///
 /// On a build with no native backend (for example the `wasm-sqlite` build)
-/// there is no native default, so the backend must be named explicitly — for
+/// there is no native default, so the backend must be named explicitly - for
 /// example `Database<WasmBridgeBackend>`, aliased as `WasmDatabase`.
 ///
-/// Wraps a storage layer and provides DynamoDB-compatible operations.
-/// Thread-safe via `Arc<Mutex<>>`, so clone freely across threads.
+/// Wraps a storage layer and provides DynamoDB-compatible operations. Backend
+/// access is serialised by [`BackendMutex`] (an async mutex on wasm); clone
+/// freely, only the `Arc`s are copied.
 #[cfg(not(any(feature = "native-sqlite", feature = "_has-encryption")))]
 pub struct Database<S> {
-    inner: Arc<Mutex<S>>,
+    inner: Arc<BackendMutex<S>>,
     idempotency_tokens: Arc<Mutex<TokenCache>>,
 }
 
@@ -759,8 +776,15 @@ impl Database<RusqliteBackend> {
 ///
 /// Mirrors the native facade method-for-method, but each call is `async` and
 /// awaits the shared action handler directly - there is no `block_on`, because
-/// the wasm backend's bridge calls genuinely suspend. The wasm runtime is
-/// single-threaded, so the per-call lock is contention-free.
+/// the wasm backend's bridge calls genuinely suspend.
+///
+/// Calls on one instance are serialised: each holds an async mutex over the
+/// single wa-sqlite connection for the whole handler, so a transaction's
+/// begin..commit cannot interleave with another call, and concurrent callers
+/// (for example two awaited operations on one `WasmDatabase`) queue rather
+/// than deadlock. Because the mutex is async, queuing suspends instead of
+/// blocking the single-threaded runtime; because there is only ever one
+/// writer at a time, `BEGIN IMMEDIATE` cannot return `SQLITE_BUSY`.
 #[cfg(feature = "wasm-sqlite")]
 impl Database<WasmBridgeBackend> {
     /// Open (or create) a wa-sqlite database persisted to OPFS under `name`.
@@ -769,16 +793,17 @@ impl Database<WasmBridgeBackend> {
             .await
             .map_err(DynoxideError::from)?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(backend)),
+            inner: Arc::new(BackendMutex::new(backend)),
             idempotency_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    /// Lock the single backend for the span of one handler call.
-    fn backend(&self) -> Result<std::sync::MutexGuard<'_, WasmBridgeBackend>> {
-        self.inner
-            .lock()
-            .map_err(|e| DynoxideError::InternalServerError(format!("Lock poisoned: {e}")))
+    /// Lock the single backend for the span of one handler call. The guard is
+    /// held across the whole call so the operation (including any transaction)
+    /// is atomic; the async mutex queues concurrent callers rather than
+    /// deadlocking, and never poisons.
+    async fn backend(&self) -> async_lock::MutexGuard<'_, WasmBridgeBackend> {
+        self.inner.lock().await
     }
 
     /// Create a new DynamoDB table.
@@ -786,7 +811,7 @@ impl Database<WasmBridgeBackend> {
         &self,
         request: actions::create_table::CreateTableRequest,
     ) -> Result<actions::create_table::CreateTableResponse> {
-        let backend = self.backend()?;
+        let backend = self.backend().await;
         actions::create_table::execute(&*backend, request).await
     }
 
@@ -795,7 +820,7 @@ impl Database<WasmBridgeBackend> {
         &self,
         request: actions::delete_table::DeleteTableRequest,
     ) -> Result<actions::delete_table::DeleteTableResponse> {
-        let backend = self.backend()?;
+        let backend = self.backend().await;
         actions::delete_table::execute(&*backend, request).await
     }
 
@@ -804,7 +829,7 @@ impl Database<WasmBridgeBackend> {
         &self,
         request: actions::describe_table::DescribeTableRequest,
     ) -> Result<actions::describe_table::DescribeTableResponse> {
-        let backend = self.backend()?;
+        let backend = self.backend().await;
         actions::describe_table::execute(&*backend, request).await
     }
 
@@ -813,7 +838,7 @@ impl Database<WasmBridgeBackend> {
         &self,
         request: actions::list_tables::ListTablesRequest,
     ) -> Result<actions::list_tables::ListTablesResponse> {
-        let backend = self.backend()?;
+        let backend = self.backend().await;
         actions::list_tables::execute(&*backend, request).await
     }
 
@@ -822,7 +847,7 @@ impl Database<WasmBridgeBackend> {
         &self,
         request: actions::put_item::PutItemRequest,
     ) -> Result<actions::put_item::PutItemResponse> {
-        let backend = self.backend()?;
+        let backend = self.backend().await;
         actions::put_item::execute(&*backend, request).await
     }
 
@@ -831,7 +856,7 @@ impl Database<WasmBridgeBackend> {
         &self,
         request: actions::get_item::GetItemRequest,
     ) -> Result<actions::get_item::GetItemResponse> {
-        let backend = self.backend()?;
+        let backend = self.backend().await;
         actions::get_item::execute(&*backend, request).await
     }
 
@@ -840,7 +865,7 @@ impl Database<WasmBridgeBackend> {
         &self,
         request: actions::delete_item::DeleteItemRequest,
     ) -> Result<actions::delete_item::DeleteItemResponse> {
-        let backend = self.backend()?;
+        let backend = self.backend().await;
         actions::delete_item::execute(&*backend, request).await
     }
 
@@ -849,7 +874,7 @@ impl Database<WasmBridgeBackend> {
         &self,
         request: actions::query::QueryRequest,
     ) -> Result<actions::query::QueryResponse> {
-        let backend = self.backend()?;
+        let backend = self.backend().await;
         actions::query::execute(&*backend, request).await
     }
 
@@ -858,7 +883,7 @@ impl Database<WasmBridgeBackend> {
         &self,
         request: actions::scan::ScanRequest,
     ) -> Result<actions::scan::ScanResponse> {
-        let backend = self.backend()?;
+        let backend = self.backend().await;
         actions::scan::execute(&*backend, request).await
     }
 }

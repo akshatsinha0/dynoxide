@@ -39,7 +39,7 @@ import = ["cli", "dep:toml", "dep:fake", "dep:sha2", "dep:flate2", "dep:indicati
 # against a JS wa-sqlite build over a wasm-bindgen bridge, persisting to OPFS.
 # Preview: the wasm build is not verified by the conformance suite (see the
 # conformance note in the README).
-wasm-sqlite = ["dep:wasm-bindgen", "dep:js-sys", "dep:wasm-bindgen-futures", "dep:web-sys"]
+wasm-sqlite = ["dep:wasm-bindgen", "dep:js-sys", "dep:wasm-bindgen-futures", "dep:web-sys", "dep:async-lock"]
 
 # Browser smoke-test entry point over the wasm-sqlite backend. Opt-in so the
 # `#[wasm_bindgen]` harness export stays out of the production wasm build.
@@ -103,6 +103,10 @@ wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 web-sys = { version = "0.3", optional = true, features = ["console"] }
+# Async mutex serialising access to the single wa-sqlite connection. A std
+# mutex held across the bridge await would deadlock concurrent callers on the
+# single-threaded runtime; this queues them instead.
+async-lock = { version = "3", optional = true }
 
 # uuid needs an explicit randomness source on wasm32-unknown-unknown. The `js`
 # feature wires its RNG to the browser crypto via wasm-bindgen, so the wasm
