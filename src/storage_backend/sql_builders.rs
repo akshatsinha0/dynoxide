@@ -88,8 +88,13 @@ pub fn escape_table_name(name: &str) -> String {
     name.replace('"', "\"\"")
 }
 
-/// The standard SELECT column list for `_tables` queries, in the order
-/// the backends' metadata row-mappers expect.
+/// The standard SELECT column list for `_tables` queries.
+///
+/// Both metadata row-mappers decode this positionally - native
+/// `Storage::row_to_metadata` and the wasm `WasmBridgeBackend::row_to_metadata` -
+/// so the column order is load-bearing and the two mappers must stay in lockstep
+/// with it. Append new columns at the end only: an older binary then reads a
+/// database written by a newer one by simply not selecting the trailing column.
 pub(crate) const TABLE_METADATA_COLUMNS: &str = "table_name, key_schema, attribute_definitions, gsi_definitions, \
      lsi_definitions, stream_enabled, stream_view_type, stream_label, ttl_attribute, ttl_enabled, \
      created_at, table_status, billing_mode, provisioned_throughput, \
