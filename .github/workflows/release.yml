@@ -473,13 +473,18 @@ jobs:
         continue-on-error: true
         env:
           META_JSON: ${{ steps.meta.outputs.json }}
+          ECR_ALIAS: ${{ vars.ECR_PUBLIC_ALIAS }}
         run: |
           set -euo pipefail
+          if [ -z "${ECR_ALIAS:-}" ]; then
+            echo "::warning::ECR_PUBLIC_ALIAS is not set; skipping ECR Public mirror"
+            exit 0
+          fi
           echo "$META_JSON" | jq -r '.tags[]' | while read -r src_tag; do
             tag="${src_tag##*:}"
-            echo "Mirroring $src_tag -> public.ecr.aws/nubo-db/dynoxide:${tag}"
+            echo "Mirroring $src_tag -> public.ecr.aws/${ECR_ALIAS}/dynoxide:${tag}"
             docker buildx imagetools create \
-              -t "public.ecr.aws/nubo-db/dynoxide:${tag}" \
+              -t "public.ecr.aws/${ECR_ALIAS}/dynoxide:${tag}" \
               "$src_tag"
           done
 
