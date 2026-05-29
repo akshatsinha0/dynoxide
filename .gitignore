@@ -1,4 +1,7 @@
 /target
+/pkg
+/dist
+/node_modules
 *.swp
 *.swo
 *~

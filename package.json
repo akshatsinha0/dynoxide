@@ -1,0 +1,15 @@
+{
+  "name": "dynoxide-wasm",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "JS bridge and build for the dynoxide wasm-sqlite backend (preview). Bundles the wa-sqlite glue and the wasm-bindgen Worker into a self-contained dist/.",
+  "scripts": {
+    "build:wasm": "./scripts/build-wasm.sh",
+    "build:wasm:dev": "./scripts/build-wasm.sh --dev"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0",
+    "wa-sqlite": "^1.0.0"
+  }
+}

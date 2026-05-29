@@ -12,30 +12,44 @@ rust-version = "1.85"
 
 [lib]
 name = "dynoxide"
+# rlib for native consumers (bin, tests, benches); cdylib for the wasm-bindgen
+# build (wasm-pack emits the .wasm module from the cdylib).
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["native-sqlite", "http-server", "mcp-server", "import"]
-http-server = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:clap", "dep:tracing", "dep:tracing-subscriber", "dep:socket2", "dep:crc32fast"]
-native-sqlite = ["rusqlite/bundled"]
+
+# Marker feature for the CLI binary (`src/main.rs`). The binary always needs
+# clap and one of the CLI-capable features below; `[[bin]] required-features`
+# keys off `cli` so the binary is skipped in backend-neutral builds such as
+# `--no-default-features --features wasm-sqlite`, which ship the library only.
+cli = ["dep:clap"]
+http-server = ["cli", "dep:axum", "dep:tokio", "dep:tower-http", "dep:tracing", "dep:tracing-subscriber", "dep:socket2", "dep:crc32fast"]
+native-sqlite = ["dep:rusqlite", "rusqlite/bundled"]
 _has-encryption = ["dep:zeroize"]
 encryption = ["_has-encryption", "rusqlite/bundled-sqlcipher-vendored-openssl"]
 encryption-cc = ["_has-encryption", "rusqlite/bundled-sqlcipher"]
 encrypted-server = ["encryption", "http-server"]
 encrypted-server-cc = ["encryption-cc", "http-server"]
 encrypted-full = ["encryption", "http-server", "mcp-server", "import"]
-mcp-server = ["dep:rmcp", "dep:schemars", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:clap", "dep:tracing", "dep:tracing-subscriber", "dep:libc", "dep:directories", "dep:subtle"]
-import = ["dep:clap", "dep:toml", "dep:fake", "dep:sha2", "dep:flate2", "dep:indicatif", "dep:zstd", "dep:tempfile"]
+mcp-server = ["cli", "dep:rmcp", "dep:schemars", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:tracing", "dep:tracing-subscriber", "dep:libc", "dep:directories", "dep:subtle"]
+import = ["cli", "dep:toml", "dep:fake", "dep:sha2", "dep:flate2", "dep:indicatif", "dep:zstd", "dep:tempfile"]
 
-# Compile-only wa-sqlite stub. Surfaces trait-shape drift at type-check
-# time so a real wa-sqlite backend does not absorb that drift later. Not
-# a working backend; bodies are unimplemented!().
-wasm-stub = []
+# Real wa-sqlite backend. dynoxide compiles to wasm32-unknown-unknown and runs
+# against a JS wa-sqlite build over a wasm-bindgen bridge, persisting to OPFS.
+# Preview: the wasm build is not verified by the conformance suite (see the
+# conformance note in the README).
+wasm-sqlite = ["dep:wasm-bindgen", "dep:js-sys", "dep:wasm-bindgen-futures", "dep:web-sys", "dep:async-lock"]
+
+# Browser smoke-test entry point over the wasm-sqlite backend. Opt-in so the
+# `#[wasm_bindgen]` harness export stays out of the production wasm build.
+wasm-harness = ["wasm-sqlite"]
 
 # Backward-compatible alias — identical to default features
 full = ["native-sqlite", "http-server", "mcp-server", "import"]
 
 [dependencies]
-rusqlite = { version = "0.36", features = ["backup", "functions"] }
+rusqlite = { version = "0.36", features = ["backup", "functions"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -43,6 +57,10 @@ base64 = "0.22"
 bigdecimal = "0.4"
 uuid = { version = "1", features = ["v4", "v5", "v7"] }
 md5 = "0.7"
+# Cross-platform time. Re-exports std::time on native (zero cost); on wasm32 it
+# sources Instant/SystemTime from the browser clock so the shared time-bearing
+# paths (idempotency cache, created_at stamps, SystemClock) do not panic.
+web-time = "1"
 # Drives the always-ready native handler futures to completion for the
 # synchronous `Database` facade. A minimal block_on that never spawns threads,
 # so it is safe to call from inside the tokio-based HTTP/MCP servers.
@@ -78,6 +96,25 @@ indicatif = { version = "0.17", optional = true }
 zstd = { version = "0.13", optional = true }
 tempfile = { version = "3", optional = true }
 
+# wasm wa-sqlite backend dependencies, enabled by the `wasm-sqlite` feature.
+# All four are already in the lock (pulled by uuid/web-time on wasm), so this
+# only marks them as direct, feature-gated dependencies.
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["console"] }
+# Async mutex serialising access to the single wa-sqlite connection. A std
+# mutex held across the bridge await would deadlock concurrent callers on the
+# single-threaded runtime; this queues them instead.
+async-lock = { version = "3", optional = true }
+
+# uuid needs an explicit randomness source on wasm32-unknown-unknown. The `js`
+# feature wires its RNG to the browser crypto via wasm-bindgen, so the wasm
+# build does not need getrandom's backend cfg. Native targets are unaffected
+# and keep the default getrandom-backed RNG.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1", features = ["js"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
@@ -86,6 +123,21 @@ aws-sdk-dynamodb = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-credential-types = "1"
 tempfile = "3.25.0"
+
+# wasm-pack runs wasm-opt on release builds. Enable the wasm features rustc
+# emits for wasm32-unknown-unknown so wasm-opt validates the input, then
+# optimise for size. Without these it aborts with "all used features should be
+# allowed".
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+    '-Os',
+    '--enable-bulk-memory',
+    '--enable-sign-ext',
+    '--enable-mutable-globals',
+    '--enable-nontrapping-float-to-int',
+    '--enable-multivalue',
+    '--enable-reference-types',
+]
 
 [profile.release]
 opt-level = "s"
@@ -97,3 +149,4 @@ strip = true
 [[bin]]
 name = "dynoxide"
 path = "src/main.rs"
+required-features = ["cli"]

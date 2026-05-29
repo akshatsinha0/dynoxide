@@ -79,17 +79,24 @@ jobs:
             exit 1
           fi
 
-  wasm-stub-check:
-    name: wasm-stub trait-shape check
+  wasm-check:
+    name: wasm-sqlite build check
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
 
-      - name: cargo check --features wasm-stub
-        run: cargo check --features wasm-stub --lib
+      - name: cargo check (wasm32, wasm-sqlite)
+        run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm-sqlite --lib
+
+      # The harness exercises WasmDatabase and the action types directly, so it
+      # catches trait or re-export drift the wasm-sqlite check alone misses.
+      - name: cargo check (wasm32, wasm-harness)
+        run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm-harness --lib
 
   # Gate the Docker smoke test on the paths that can actually break the
   # documented MCP-in-Docker recipe. src/main.rs carries the ServeArgs/McpArgs

@@ -29,11 +29,15 @@ compile_error!(
      Use the `encryption` feature for vendored OpenSSL on non-Apple platforms."
 );
 
-#[cfg(not(any(feature = "native-sqlite", feature = "_has-encryption")))]
+#[cfg(not(any(
+    feature = "native-sqlite",
+    feature = "_has-encryption",
+    feature = "wasm-sqlite"
+)))]
 compile_error!(
-    "Either `native-sqlite`, `encryption`, or `encryption-cc` feature must be enabled. \
-     Default features include `native-sqlite`. If you used \
-     `default-features = false`, add one of these features."
+    "A storage backend feature must be enabled: `native-sqlite`, `encryption`, \
+     `encryption-cc`, or `wasm-sqlite`. Default features include `native-sqlite`. \
+     If you used `default-features = false`, add one of these features."
 );
 
 pub mod actions;
@@ -57,17 +61,21 @@ pub mod streams;
 pub mod ttl;
 pub mod types;
 pub mod validation;
+#[cfg(feature = "wasm-harness")]
+pub mod wasm_harness;
 
 #[doc(hidden)]
 pub use macros::ItemInsert;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use web_time::Instant;
 
 pub use errors::{DynoxideError, Result};
 pub use storage::{DatabaseInfo, TableInfoEntry, TableMetadata, TableStats};
 pub use storage_backend::BackendError;
+#[cfg(feature = "wasm-sqlite")]
+pub use storage_backend::WasmBridgeBackend;
 pub use types::{AttributeValue, ConversionError, Item};
 
 /// Options for `Database::import_items()`.
@@ -102,6 +110,7 @@ type TokenCache = HashMap<
 ///
 /// `Database`'s type parameter defaults to this, so existing native callers
 /// keep writing `Database` and get the synchronous rusqlite-backed engine.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub type RusqliteBackend = storage::Storage;
 
 /// The native, synchronous `Database`.
@@ -111,7 +120,31 @@ pub type RusqliteBackend = storage::Storage;
 /// unchanged: each method drives an async handler future to completion with
 /// `block_on`. Because the native backend's futures never suspend, that
 /// `block_on` never parks the thread.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub type NativeDatabase = Database<RusqliteBackend>;
+
+/// The wasm, asynchronous `Database` over the wa-sqlite backend.
+///
+/// Alias for [`Database`] monomorphised over [`WasmBridgeBackend`]. Unlike
+/// [`NativeDatabase`], its methods are `async fn` and never call `block_on`:
+/// the wasm backend awaits real wa-sqlite promises, and the wasm main thread
+/// must not block.
+#[cfg(feature = "wasm-sqlite")]
+pub type WasmDatabase = Database<WasmBridgeBackend>;
+
+/// Build-visible preview marker for the wasm-sqlite backend.
+///
+/// `true` when built with `--features wasm-sqlite`, `false` otherwise. The wasm
+/// backend covers CRUD, query, scan, and GSI/LSI, but it is not run against the
+/// dynamodb-conformance suite that covers the native build. Consumers can read
+/// this constant to tell whether the artifact they hold is the conformance-
+/// tested native build or the wasm preview.
+#[cfg(feature = "wasm-sqlite")]
+pub const WASM_PREVIEW: bool = true;
+/// Build-visible preview marker for the wasm-sqlite backend. See the
+/// `wasm-sqlite` variant for details.
+#[cfg(not(feature = "wasm-sqlite"))]
+pub const WASM_PREVIEW: bool = false;
 
 /// The main entry point for the DynamoDB emulator.
 ///
@@ -121,8 +154,40 @@ pub type NativeDatabase = Database<RusqliteBackend>;
 ///
 /// Wraps a storage layer and provides DynamoDB-compatible operations.
 /// Thread-safe via `Arc<Mutex<>>`, so clone freely across threads.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub struct Database<S = RusqliteBackend> {
     inner: Arc<Mutex<S>>,
+    idempotency_tokens: Arc<Mutex<TokenCache>>,
+}
+
+/// Serialises backend access on the backend-neutral build. On wasm this is an
+/// async mutex: the bridge calls genuinely suspend, so a std mutex held across
+/// them would deadlock concurrent callers on the single-threaded runtime,
+/// whereas an async mutex queues them. Off wasm (the degenerate no-backend
+/// shell, which can never construct a `Database`) a std mutex stands in.
+#[cfg(all(
+    not(any(feature = "native-sqlite", feature = "_has-encryption")),
+    feature = "wasm-sqlite"
+))]
+use async_lock::Mutex as BackendMutex;
+#[cfg(all(
+    not(any(feature = "native-sqlite", feature = "_has-encryption")),
+    not(feature = "wasm-sqlite")
+))]
+use std::sync::Mutex as BackendMutex;
+
+/// The main entry point for the DynamoDB emulator (backend-neutral build).
+///
+/// On a build with no native backend (for example the `wasm-sqlite` build)
+/// there is no native default, so the backend must be named explicitly - for
+/// example `Database<WasmBridgeBackend>`, aliased as `WasmDatabase`.
+///
+/// Wraps a storage layer and provides DynamoDB-compatible operations. Backend
+/// access is serialised by [`BackendMutex`] (an async mutex on wasm); clone
+/// freely, only the `Arc`s are copied.
+#[cfg(not(any(feature = "native-sqlite", feature = "_has-encryption")))]
+pub struct Database<S> {
+    inner: Arc<BackendMutex<S>>,
     idempotency_tokens: Arc<Mutex<TokenCache>>,
 }
 
@@ -136,6 +201,7 @@ impl<S> Clone for Database<S> {
     }
 }
 
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 impl Database<RusqliteBackend> {
     /// Open a persistent database at the given path.
     pub fn new(path: &str) -> Result<Self> {
@@ -706,7 +772,123 @@ impl Database<RusqliteBackend> {
     }
 }
 
-#[cfg(test)]
+/// The wasm, asynchronous facade over the wa-sqlite backend.
+///
+/// Mirrors the native facade method-for-method, but each call is `async` and
+/// awaits the shared action handler directly - there is no `block_on`, because
+/// the wasm backend's bridge calls genuinely suspend.
+///
+/// Calls on one instance are serialised: each holds an async mutex over the
+/// single wa-sqlite connection for the whole handler, so a transaction's
+/// begin..commit cannot interleave with another call, and concurrent callers
+/// (for example two awaited operations on one `WasmDatabase`) queue rather
+/// than deadlock. Because the mutex is async, queuing suspends instead of
+/// blocking the single-threaded runtime; because there is only ever one
+/// writer at a time, `BEGIN IMMEDIATE` cannot return `SQLITE_BUSY`.
+#[cfg(feature = "wasm-sqlite")]
+impl Database<WasmBridgeBackend> {
+    /// Open (or create) a wa-sqlite database persisted to OPFS under `name`.
+    pub async fn open(name: &str) -> Result<Self> {
+        let backend = WasmBridgeBackend::open(name)
+            .await
+            .map_err(DynoxideError::from)?;
+        Ok(Self {
+            inner: Arc::new(BackendMutex::new(backend)),
+            idempotency_tokens: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    /// Lock the single backend for the span of one handler call. The guard is
+    /// held across the whole call so the operation (including any transaction)
+    /// is atomic; the async mutex queues concurrent callers rather than
+    /// deadlocking, and never poisons.
+    async fn backend(&self) -> async_lock::MutexGuard<'_, WasmBridgeBackend> {
+        self.inner.lock().await
+    }
+
+    /// Create a new DynamoDB table.
+    pub async fn create_table(
+        &self,
+        request: actions::create_table::CreateTableRequest,
+    ) -> Result<actions::create_table::CreateTableResponse> {
+        let backend = self.backend().await;
+        actions::create_table::execute(&*backend, request).await
+    }
+
+    /// Delete a DynamoDB table.
+    pub async fn delete_table(
+        &self,
+        request: actions::delete_table::DeleteTableRequest,
+    ) -> Result<actions::delete_table::DeleteTableResponse> {
+        let backend = self.backend().await;
+        actions::delete_table::execute(&*backend, request).await
+    }
+
+    /// Describe a DynamoDB table.
+    pub async fn describe_table(
+        &self,
+        request: actions::describe_table::DescribeTableRequest,
+    ) -> Result<actions::describe_table::DescribeTableResponse> {
+        let backend = self.backend().await;
+        actions::describe_table::execute(&*backend, request).await
+    }
+
+    /// List DynamoDB tables.
+    pub async fn list_tables(
+        &self,
+        request: actions::list_tables::ListTablesRequest,
+    ) -> Result<actions::list_tables::ListTablesResponse> {
+        let backend = self.backend().await;
+        actions::list_tables::execute(&*backend, request).await
+    }
+
+    /// Put an item into a DynamoDB table.
+    pub async fn put_item(
+        &self,
+        request: actions::put_item::PutItemRequest,
+    ) -> Result<actions::put_item::PutItemResponse> {
+        let backend = self.backend().await;
+        actions::put_item::execute(&*backend, request).await
+    }
+
+    /// Get an item from a DynamoDB table.
+    pub async fn get_item(
+        &self,
+        request: actions::get_item::GetItemRequest,
+    ) -> Result<actions::get_item::GetItemResponse> {
+        let backend = self.backend().await;
+        actions::get_item::execute(&*backend, request).await
+    }
+
+    /// Delete an item from a DynamoDB table.
+    pub async fn delete_item(
+        &self,
+        request: actions::delete_item::DeleteItemRequest,
+    ) -> Result<actions::delete_item::DeleteItemResponse> {
+        let backend = self.backend().await;
+        actions::delete_item::execute(&*backend, request).await
+    }
+
+    /// Query a DynamoDB table or secondary index.
+    pub async fn query(
+        &self,
+        request: actions::query::QueryRequest,
+    ) -> Result<actions::query::QueryResponse> {
+        let backend = self.backend().await;
+        actions::query::execute(&*backend, request).await
+    }
+
+    /// Scan a DynamoDB table or secondary index.
+    pub async fn scan(
+        &self,
+        request: actions::scan::ScanRequest,
+    ) -> Result<actions::scan::ScanResponse> {
+        let backend = self.backend().await;
+        actions::scan::execute(&*backend, request).await
+    }
+}
+
+#[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]
 mod tests {
     use super::*;
 

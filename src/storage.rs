@@ -1,17 +1,22 @@
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 use crate::errors::{DynoxideError, Result};
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 use crate::storage_backend::clock::{Clock, SystemClock};
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+use crate::storage_backend::sql_builders::{self, escape_table_name};
 use crate::types::AttributeValue;
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 use rusqlite::{Connection, params};
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::sync::Arc;
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
 /// Current schema version. Stored in the `_config` table for future migrations.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 const SCHEMA_VERSION: &str = "8";
 
 /// Number of hash buckets used for parallel scan segment assignment.
 /// Matches dynalite's implementation.
-const HASH_BUCKETS: u32 = 4096;
+pub(crate) const HASH_BUCKETS: u32 = 4096;
 
 // ---------------------------------------------------------------------------
 // MD5-based hash prefix for parallel scan (dynalite-compatible)
@@ -182,7 +187,7 @@ pub fn hash_in_segment(hash_prefix: &str, segment: u32, total_segments: u32) -> 
     bucket >= start && bucket <= end
 }
 
-fn ceiling_div(a: u32, b: u32) -> u32 {
+pub(crate) fn ceiling_div(a: u32, b: u32) -> u32 {
     a.div_ceil(b)
 }
 
@@ -235,6 +240,10 @@ pub struct QueryParams<'a> {
 ///
 /// Manages the SQLite connection, metadata tables, and per-DynamoDB-table
 /// data tables. All SQL lives here — higher layers work with Rust types.
+///
+/// Native-only: this type is the rusqlite-backed backend and is compiled out
+/// of backend-neutral builds (for example `wasm-sqlite`).
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub struct Storage {
     conn: Connection,
     /// In-memory cache of table metadata to avoid repeated SQLite reads.
@@ -244,6 +253,7 @@ pub struct Storage {
     clock: Arc<dyn Clock>,
 }
 
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 impl Storage {
     /// Open a persistent database at the given path.
     pub fn new(path: &str) -> Result<Self> {
@@ -360,49 +370,8 @@ impl Storage {
             },
         )?;
 
-        // Create metadata tables
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS _config (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS _tables (
-                table_name TEXT PRIMARY KEY,
-                key_schema TEXT NOT NULL,
-                attribute_definitions TEXT NOT NULL,
-                gsi_definitions TEXT,
-                lsi_definitions TEXT,
-                stream_enabled INTEGER DEFAULT 0,
-                stream_view_type TEXT,
-                stream_label TEXT,
-                ttl_attribute TEXT,
-                ttl_enabled INTEGER DEFAULT 0,
-                created_at INTEGER NOT NULL,
-                table_status TEXT NOT NULL DEFAULT 'ACTIVE',
-                billing_mode TEXT DEFAULT 'PAY_PER_REQUEST',
-                provisioned_throughput TEXT,
-                tags TEXT,
-                sse_specification TEXT,
-                table_class TEXT,
-                deletion_protection_enabled INTEGER DEFAULT 0,
-                on_demand_throughput TEXT,
-                table_id TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS _stream_records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                table_name TEXT NOT NULL,
-                event_name TEXT NOT NULL,
-                keys_json TEXT NOT NULL,
-                new_image TEXT,
-                old_image TEXT,
-                sequence_number TEXT NOT NULL,
-                shard_id TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                user_identity TEXT
-            );",
-        )?;
+        // Create metadata tables (schema shared with the wasm backend).
+        self.conn.execute_batch(sql_builders::INIT_SCHEMA)?;
 
         // Migrate: add user_identity column if it doesn't exist (for databases created before Phase 11)
         let _ = self
@@ -653,34 +622,9 @@ impl Storage {
     /// Insert a row into the `_tables` metadata table.
     pub fn insert_table_metadata(&self, m: &CreateTableMetadata) -> Result<()> {
         let table_name = m.table_name;
-        // TableId is assigned once, at create time, and never changes for this
-        // incarnation of the table. AWS uses a random v4 UUID; a recreated table
-        // gets a fresh one. Generating it here (not deriving it from table state)
-        // means a drop + recreate yields a different id even within the same
-        // second, matching AWS, and the value is persisted so it stays stable
-        // across reads. See #55.
-        let table_id = uuid::Uuid::new_v4().to_string();
-        self.conn.execute(
-            "INSERT INTO _tables (table_name, key_schema, attribute_definitions, gsi_definitions, \
-             lsi_definitions, provisioned_throughput, created_at, sse_specification, table_class, \
-             deletion_protection_enabled, billing_mode, on_demand_throughput, table_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                m.table_name,
-                m.key_schema,
-                m.attribute_definitions,
-                m.gsi_definitions,
-                m.lsi_definitions,
-                m.provisioned_throughput,
-                m.created_at,
-                m.sse_specification,
-                m.table_class,
-                m.deletion_protection_enabled as i32,
-                m.billing_mode,
-                m.on_demand_throughput,
-                table_id,
-            ],
-        )?;
+        let (sql, params) = sql_builders::insert_table_metadata(m);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         self.metadata_cache.borrow_mut().remove(table_name);
         Ok(())
     }
@@ -696,10 +640,10 @@ impl Storage {
             return Ok(Some(cached.clone()));
         }
 
-        let sql = format!("SELECT {TABLE_METADATA_COLUMNS} FROM _tables WHERE table_name = ?1");
+        let (sql, params) = sql_builders::get_table_metadata(table_name);
         let mut stmt = self.conn.prepare(&sql)?;
 
-        let result = stmt.query_row(params![table_name], row_to_metadata);
+        let result = stmt.query_row(rusqlite::params_from_iter(params.iter()), row_to_metadata);
 
         match result {
             Ok(meta) => {
@@ -715,10 +659,10 @@ impl Storage {
 
     /// Delete metadata for a table.
     pub fn delete_table_metadata(&self, table_name: &str) -> Result<bool> {
-        let affected = self.conn.execute(
-            "DELETE FROM _tables WHERE table_name = ?1",
-            params![table_name],
-        )?;
+        let (sql, params) = sql_builders::delete_table_metadata(table_name);
+        let affected = self
+            .conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         self.metadata_cache.borrow_mut().remove(table_name);
         Ok(affected > 0)
     }
@@ -883,22 +827,22 @@ impl Storage {
 
     /// List all table names.
     pub fn list_table_names(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT table_name FROM _tables ORDER BY table_name")?;
+        let (sql, params) = sql_builders::list_table_names();
+        let mut stmt = self.conn.prepare(&sql)?;
         let names = stmt
-            .query_map([], |row| row.get(0))?
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| row.get(0))?
             .collect::<std::result::Result<Vec<String>, _>>()?;
         Ok(names)
     }
 
     /// Check if a table exists in metadata.
     pub fn table_exists(&self, table_name: &str) -> Result<bool> {
-        let count: i32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM _tables WHERE table_name = ?1",
-            params![table_name],
-            |row| row.get(0),
-        )?;
+        let (sql, params) = sql_builders::table_exists(table_name);
+        let count: i32 =
+            self.conn
+                .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                    row.get(0)
+                })?;
         Ok(count > 0)
     }
 
@@ -914,60 +858,32 @@ impl Storage {
 
     /// Create a data table for a DynamoDB table.
     pub fn create_data_table(&self, table_name: &str) -> Result<()> {
-        let sql = format!(
-            "CREATE TABLE \"{}\" (
-                pk TEXT NOT NULL,
-                sk TEXT NOT NULL DEFAULT '',
-                item_json TEXT NOT NULL,
-                item_size INTEGER NOT NULL,
-                cached_at REAL,
-                hash_prefix TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (pk, sk)
-            )",
-            escape_table_name(table_name)
-        );
-        self.conn.execute(&sql, [])?;
+        let (sql, params) = sql_builders::create_data_table(table_name);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
     /// Drop a data table.
     pub fn drop_data_table(&self, table_name: &str) -> Result<()> {
-        let sql = format!("DROP TABLE IF EXISTS \"{}\"", escape_table_name(table_name));
-        self.conn.execute(&sql, [])?;
+        let (sql, params) = sql_builders::drop_data_table(table_name);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
     /// Create a GSI table.
     pub fn create_gsi_table(&self, table_name: &str, index_name: &str) -> Result<()> {
-        let gsi_table_name = format!("{table_name}::gsi::{index_name}");
-        let escaped = escape_table_name(&gsi_table_name);
-        let sql = format!(
-            "CREATE TABLE \"{escaped}\" (
-                gsi_pk TEXT NOT NULL,
-                gsi_sk TEXT NOT NULL DEFAULT '',
-                table_pk TEXT NOT NULL,
-                table_sk TEXT NOT NULL DEFAULT '',
-                item_json TEXT NOT NULL,
-                PRIMARY KEY (gsi_pk, gsi_sk, table_pk, table_sk)
-            )"
-        );
-        self.conn.execute(&sql, [])?;
-
-        let idx_name = escape_table_name(&format!("{gsi_table_name}::base_key"));
-        self.conn.execute_batch(&format!(
-            "CREATE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{escaped}\" (table_pk, table_sk)"
-        ))?;
+        let (sql, _) = sql_builders::create_gsi_table(table_name, index_name);
+        self.conn.execute_batch(&sql)?;
         Ok(())
     }
 
     /// Drop a GSI table.
     pub fn drop_gsi_table(&self, table_name: &str, index_name: &str) -> Result<()> {
-        let gsi_table_name = format!("{table_name}::gsi::{index_name}");
-        let sql = format!(
-            "DROP TABLE IF EXISTS \"{}\"",
-            escape_table_name(&gsi_table_name)
-        );
-        self.conn.execute(&sql, [])?;
+        let (sql, params) = sql_builders::drop_gsi_table(table_name, index_name);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -987,14 +903,11 @@ impl Storage {
         table_sk: &str,
         item_json: &str,
     ) -> Result<()> {
-        let gsi_table_name = format!("{table_name}::gsi::{index_name}");
-        let sql = format!(
-            "INSERT OR REPLACE INTO \"{}\" (gsi_pk, gsi_sk, table_pk, table_sk, item_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-            escape_table_name(&gsi_table_name)
-        );
+        let sql = sql_builders::gsi_insert_sql(table_name, index_name);
+        let params = sql_builders::gsi_insert_params(gsi_pk, gsi_sk, table_pk, table_sk, item_json);
         self.conn
             .prepare_cached(&sql)?
-            .execute(params![gsi_pk, gsi_sk, table_pk, table_sk, item_json])?;
+            .execute(rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -1007,20 +920,17 @@ impl Storage {
         index_name: &str,
         rows: &[crate::storage_backend::GsiItemRow],
     ) -> Result<()> {
-        let gsi_table_name = format!("{table_name}::gsi::{index_name}");
-        let sql = format!(
-            "INSERT OR REPLACE INTO \"{}\" (gsi_pk, gsi_sk, table_pk, table_sk, item_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-            escape_table_name(&gsi_table_name)
-        );
+        let sql = sql_builders::gsi_insert_sql(table_name, index_name);
         let mut stmt = self.conn.prepare_cached(&sql)?;
         for row in rows {
-            stmt.execute(params![
-                row.gsi_pk,
-                row.gsi_sk,
-                row.table_pk,
-                row.table_sk,
-                row.item_json
-            ])?;
+            let params = sql_builders::gsi_insert_params(
+                &row.gsi_pk,
+                &row.gsi_sk,
+                &row.table_pk,
+                &row.table_sk,
+                &row.item_json,
+            );
+            stmt.execute(rusqlite::params_from_iter(params.iter()))?;
         }
         Ok(())
     }
@@ -1033,14 +943,11 @@ impl Storage {
         table_pk: &str,
         table_sk: &str,
     ) -> Result<()> {
-        let gsi_table_name = format!("{table_name}::gsi::{index_name}");
-        let sql = format!(
-            "DELETE FROM \"{}\" WHERE table_pk = ?1 AND table_sk = ?2",
-            escape_table_name(&gsi_table_name)
-        );
+        let (sql, params) =
+            sql_builders::delete_gsi_item(table_name, index_name, table_pk, table_sk);
         self.conn
             .prepare_cached(&sql)?
-            .execute(params![table_pk, table_sk])?;
+            .execute(rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -1052,73 +959,11 @@ impl Storage {
         gsi_pk: &str,
         params: &QueryParams,
     ) -> Result<Vec<(String, String, String)>> {
-        let gsi_table_name = format!("{table_name}::gsi::{index_name}");
-        let mut sql = format!(
-            "SELECT gsi_pk, gsi_sk, item_json FROM \"{}\" WHERE gsi_pk = ?1",
-            escape_table_name(&gsi_table_name)
-        );
-
-        let mut param_idx = 2;
-        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(gsi_pk.to_string())];
-
-        if let Some(cond) = params.sk_condition {
-            // Replace "sk" with "gsi_sk" in the condition.
-            // N.B. This string replacement works because all SQL fragments generated
-            // by key_condition use the form ` sk ` or ` sk>` — they never embed
-            // `sk` without surrounding whitespace/operator. A more robust solution
-            // would thread the column name through the key condition builder, but
-            // that is a larger refactor deferred for now.
-            let gsi_cond = cond.replace(" sk ", " gsi_sk ").replace(" sk>", " gsi_sk>");
-            sql.push(' ');
-            sql.push_str(&gsi_cond);
-            for &p in params.sk_params {
-                all_params.push(Box::new(p.to_string()));
-                param_idx += 1;
-            }
-        }
-
-        // For GSI pagination, use a composite cursor (gsi_sk, table_pk, table_sk)
-        // so that hash-only GSIs (where gsi_sk is always '') paginate correctly.
-        if let (Some(start_sk), Some(start_base_pk), Some(start_base_sk)) = (
-            params.exclusive_start_sk,
-            params.exclusive_start_base_pk,
-            params.exclusive_start_base_sk,
-        ) {
-            let op = if params.forward { ">" } else { "<" };
-            sql.push_str(&format!(
-                " AND (gsi_sk, table_pk, table_sk) {op} (?{}, ?{}, ?{})",
-                param_idx,
-                param_idx + 1,
-                param_idx + 2
-            ));
-            all_params.push(Box::new(start_sk.to_string()));
-            all_params.push(Box::new(start_base_pk.to_string()));
-            all_params.push(Box::new(start_base_sk.to_string()));
-        } else if let Some(start_sk) = params.exclusive_start_sk {
-            if params.forward {
-                sql.push_str(&format!(" AND gsi_sk > ?{param_idx}"));
-            } else {
-                sql.push_str(&format!(" AND gsi_sk < ?{param_idx}"));
-            }
-            all_params.push(Box::new(start_sk.to_string()));
-        }
-
-        sql.push_str(if params.forward {
-            " ORDER BY gsi_sk ASC, table_pk ASC, table_sk ASC"
-        } else {
-            " ORDER BY gsi_sk DESC, table_pk DESC, table_sk DESC"
-        });
-
-        if let Some(lim) = params.limit {
-            sql.push_str(&format!(" LIMIT {lim}"));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            all_params.iter().map(|p| p.as_ref()).collect();
+        let (sql, params_vec) =
+            sql_builders::query_gsi_items(table_name, index_name, gsi_pk, params);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
+            .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1133,77 +978,10 @@ impl Storage {
         index_name: &str,
         params: &ScanParams,
     ) -> Result<Vec<(String, String, String)>> {
-        let gsi_table_name = format!("{table_name}::gsi::{index_name}");
-        let mut sql = format!(
-            "SELECT gsi_pk, gsi_sk, item_json FROM \"{}\"",
-            escape_table_name(&gsi_table_name)
-        );
-
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut where_clauses = Vec::new();
-        let mut param_idx = 1;
-
-        if let (Some(start_pk), Some(start_sk)) =
-            (params.exclusive_start_pk, params.exclusive_start_sk)
-        {
-            // The GSI table's primary key is (gsi_pk, gsi_sk, table_pk, table_sk).
-            // Using only (gsi_pk, gsi_sk) for the cursor skips rows that share the
-            // same GSI key but have different base table keys.
-            if let (Some(base_pk), Some(base_sk)) = (
-                params.exclusive_start_base_pk,
-                params.exclusive_start_base_sk,
-            ) {
-                where_clauses.push(format!(
-                    "(gsi_pk, gsi_sk, table_pk, table_sk) > (?{}, ?{}, ?{}, ?{})",
-                    param_idx,
-                    param_idx + 1,
-                    param_idx + 2,
-                    param_idx + 3
-                ));
-                params_vec.push(Box::new(start_pk.to_string()));
-                params_vec.push(Box::new(start_sk.to_string()));
-                params_vec.push(Box::new(base_pk.to_string()));
-                params_vec.push(Box::new(base_sk.to_string()));
-                param_idx += 4;
-            } else {
-                where_clauses.push(format!(
-                    "(gsi_pk, gsi_sk) > (?{}, ?{})",
-                    param_idx,
-                    param_idx + 1
-                ));
-                params_vec.push(Box::new(start_pk.to_string()));
-                params_vec.push(Box::new(start_sk.to_string()));
-                param_idx += 2;
-            }
-        }
-
-        // For GSI parallel scan, hash on the base table pk (table_pk column)
-        if let (Some(seg), Some(total)) = (params.segment, params.total_segments) {
-            where_clauses.push(format!(
-                "(fnv1a_hash(table_pk) % ?{}) = ?{}",
-                param_idx,
-                param_idx + 1
-            ));
-            params_vec.push(Box::new(total as i64));
-            params_vec.push(Box::new(seg as i64));
-        }
-
-        if !where_clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_clauses.join(" AND "));
-        }
-
-        sql.push_str(" ORDER BY gsi_pk ASC, gsi_sk ASC, table_pk ASC, table_sk ASC");
-
-        if let Some(lim) = params.limit {
-            sql.push_str(&format!(" LIMIT {lim}"));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
+        let (sql, params_vec) = sql_builders::scan_gsi_items(table_name, index_name, params);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
+            .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1217,35 +995,16 @@ impl Storage {
 
     /// Create an LSI table for a given base table and index name.
     pub fn create_lsi_table(&self, table_name: &str, index_name: &str) -> Result<()> {
-        let lsi_table_name = format!("{table_name}::lsi::{index_name}");
-        let escaped = escape_table_name(&lsi_table_name);
-        let sql = format!(
-            "CREATE TABLE \"{escaped}\" (
-                pk TEXT NOT NULL,
-                sk TEXT NOT NULL DEFAULT '',
-                base_pk TEXT NOT NULL,
-                base_sk TEXT NOT NULL DEFAULT '',
-                item_json TEXT NOT NULL,
-                PRIMARY KEY (pk, sk, base_pk, base_sk)
-            )"
-        );
-        self.conn.execute(&sql, [])?;
-
-        let idx_name = escape_table_name(&format!("{lsi_table_name}::base_key"));
-        self.conn.execute_batch(&format!(
-            "CREATE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{escaped}\" (base_pk, base_sk)"
-        ))?;
+        let (sql, _) = sql_builders::create_lsi_table(table_name, index_name);
+        self.conn.execute_batch(&sql)?;
         Ok(())
     }
 
     /// Drop an LSI table.
     pub fn drop_lsi_table(&self, table_name: &str, index_name: &str) -> Result<()> {
-        let lsi_table_name = format!("{table_name}::lsi::{index_name}");
-        let sql = format!(
-            "DROP TABLE IF EXISTS \"{}\"",
-            escape_table_name(&lsi_table_name)
-        );
-        self.conn.execute(&sql, [])?;
+        let (sql, params) = sql_builders::drop_lsi_table(table_name, index_name);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -1265,14 +1024,11 @@ impl Storage {
         base_sk: &str,
         item_json: &str,
     ) -> Result<()> {
-        let lsi_table_name = format!("{table_name}::lsi::{index_name}");
-        let sql = format!(
-            "INSERT OR REPLACE INTO \"{}\" (pk, sk, base_pk, base_sk, item_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-            escape_table_name(&lsi_table_name)
-        );
+        let sql = sql_builders::lsi_insert_sql(table_name, index_name);
+        let params = sql_builders::lsi_insert_params(pk, sk, base_pk, base_sk, item_json);
         self.conn
             .prepare_cached(&sql)?
-            .execute(params![pk, sk, base_pk, base_sk, item_json])?;
+            .execute(rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -1284,14 +1040,10 @@ impl Storage {
         base_pk: &str,
         base_sk: &str,
     ) -> Result<()> {
-        let lsi_table_name = format!("{table_name}::lsi::{index_name}");
-        let sql = format!(
-            "DELETE FROM \"{}\" WHERE base_pk = ?1 AND base_sk = ?2",
-            escape_table_name(&lsi_table_name)
-        );
+        let (sql, params) = sql_builders::delete_lsi_item(table_name, index_name, base_pk, base_sk);
         self.conn
             .prepare_cached(&sql)?
-            .execute(params![base_pk, base_sk])?;
+            .execute(rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -1303,65 +1055,10 @@ impl Storage {
         pk: &str,
         params: &QueryParams,
     ) -> Result<Vec<(String, String, String)>> {
-        let lsi_table_name = format!("{table_name}::lsi::{index_name}");
-        let mut sql = format!(
-            "SELECT pk, sk, item_json FROM \"{}\" WHERE pk = ?1",
-            escape_table_name(&lsi_table_name)
-        );
-
-        let mut param_idx = 2;
-        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(pk.to_string())];
-
-        if let Some(cond) = params.sk_condition {
-            sql.push(' ');
-            sql.push_str(cond);
-            for &p in params.sk_params {
-                all_params.push(Box::new(p.to_string()));
-                param_idx += 1;
-            }
-        }
-
-        // Use composite cursor when all three LSI pagination values are present,
-        // otherwise fall back to simple sk comparison.
-        if let (Some(start_sk), Some(start_base_pk), Some(start_base_sk)) = (
-            params.exclusive_start_sk,
-            params.exclusive_start_base_pk,
-            params.exclusive_start_base_sk,
-        ) {
-            let op = if params.forward { ">" } else { "<" };
-            sql.push_str(&format!(
-                " AND (sk, base_pk, base_sk) {op} (?{}, ?{}, ?{})",
-                param_idx,
-                param_idx + 1,
-                param_idx + 2
-            ));
-            all_params.push(Box::new(start_sk.to_string()));
-            all_params.push(Box::new(start_base_pk.to_string()));
-            all_params.push(Box::new(start_base_sk.to_string()));
-        } else if let Some(start_sk) = params.exclusive_start_sk {
-            if params.forward {
-                sql.push_str(&format!(" AND sk > ?{param_idx}"));
-            } else {
-                sql.push_str(&format!(" AND sk < ?{param_idx}"));
-            }
-            all_params.push(Box::new(start_sk.to_string()));
-        }
-
-        sql.push_str(if params.forward {
-            " ORDER BY sk ASC, base_pk ASC, base_sk ASC"
-        } else {
-            " ORDER BY sk DESC, base_pk DESC, base_sk DESC"
-        });
-
-        if let Some(lim) = params.limit {
-            sql.push_str(&format!(" LIMIT {lim}"));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            all_params.iter().map(|p| p.as_ref()).collect();
+        let (sql, params_vec) = sql_builders::query_lsi_items(table_name, index_name, pk, params);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
+            .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1376,77 +1073,10 @@ impl Storage {
         index_name: &str,
         params: &ScanParams,
     ) -> Result<Vec<(String, String, String)>> {
-        let lsi_table_name = format!("{table_name}::lsi::{index_name}");
-        let mut sql = format!(
-            "SELECT pk, sk, item_json FROM \"{}\"",
-            escape_table_name(&lsi_table_name)
-        );
-
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut where_clauses = Vec::new();
-        let mut param_idx = 1;
-
-        // Use composite cursor when base key values are present for correct LSI pagination.
-        if let (Some(start_pk), Some(start_sk), Some(start_base_pk), Some(start_base_sk)) = (
-            params.exclusive_start_pk,
-            params.exclusive_start_sk,
-            params.exclusive_start_base_pk,
-            params.exclusive_start_base_sk,
-        ) {
-            where_clauses.push(format!(
-                "(pk, sk, base_pk, base_sk) > (?{}, ?{}, ?{}, ?{})",
-                param_idx,
-                param_idx + 1,
-                param_idx + 2,
-                param_idx + 3
-            ));
-            params_vec.push(Box::new(start_pk.to_string()));
-            params_vec.push(Box::new(start_sk.to_string()));
-            params_vec.push(Box::new(start_base_pk.to_string()));
-            params_vec.push(Box::new(start_base_sk.to_string()));
-            param_idx += 4;
-        } else if let (Some(start_pk), Some(start_sk)) =
-            (params.exclusive_start_pk, params.exclusive_start_sk)
-        {
-            where_clauses.push(format!("(pk, sk) > (?{}, ?{})", param_idx, param_idx + 1));
-            params_vec.push(Box::new(start_pk.to_string()));
-            params_vec.push(Box::new(start_sk.to_string()));
-            param_idx += 2;
-        }
-
-        // For LSI parallel scan, hash on the base table pk (base_pk column)
-        if let (Some(seg), Some(total)) = (params.segment, params.total_segments) {
-            where_clauses.push(format!(
-                "(fnv1a_hash(base_pk) % ?{}) = ?{}",
-                param_idx,
-                param_idx + 1
-            ));
-            params_vec.push(Box::new(total as i64));
-            params_vec.push(Box::new(seg as i64));
-        }
-
-        if !where_clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_clauses.join(" AND "));
-        }
-
-        // Order by the full composite key so the scan order matches the
-        // `(pk, sk, base_pk, base_sk)` pagination cursor above. Without the
-        // base-key columns here, rows tied on (pk, sk) would only be ordered
-        // deterministically by the primary-key b-tree as an implementation
-        // accident; making it explicit mirrors `scan_gsi_items` and keeps the
-        // cursor/order invariant from depending on the query planner.
-        sql.push_str(" ORDER BY pk ASC, sk ASC, base_pk ASC, base_sk ASC");
-
-        if let Some(lim) = params.limit {
-            sql.push_str(&format!(" LIMIT {lim}"));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
+        let (sql, params_vec) = sql_builders::scan_lsi_items(table_name, index_name, params);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
+            .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1460,19 +1090,19 @@ impl Storage {
 
     /// Begin an immediate SQLite transaction.
     pub fn begin_transaction(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.conn.execute_batch(sql_builders::BEGIN)?;
         Ok(())
     }
 
     /// Commit the current transaction.
     pub fn commit(&self) -> Result<()> {
-        self.conn.execute_batch("COMMIT")?;
+        self.conn.execute_batch(sql_builders::COMMIT)?;
         Ok(())
     }
 
     /// Rollback the current transaction.
     pub fn rollback(&self) -> Result<()> {
-        self.conn.execute_batch("ROLLBACK")?;
+        self.conn.execute_batch(sql_builders::ROLLBACK)?;
         Ok(())
     }
 
@@ -1531,16 +1161,10 @@ impl Storage {
         // First, try to get the old item for return value
         let old_item = self.get_item(table_name, pk, sk)?;
 
-        let escaped = escape_table_name(table_name);
-        let sql = format!(
-            "INSERT OR REPLACE INTO \"{escaped}\" (pk, sk, item_json, item_size, cached_at, hash_prefix) \
-             VALUES (?1, ?2, ?3, ?4, \
-             (SELECT cached_at FROM \"{escaped}\" WHERE pk = ?1 AND sk = ?2), ?5)"
-        );
-        self.conn.execute(
-            &sql,
-            params![pk, sk, item_json, item_size as i64, hash_prefix],
-        )?;
+        let (sql, params) =
+            sql_builders::put_item_with_hash(table_name, pk, sk, item_json, item_size, hash_prefix);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
 
         Ok(old_item)
     }
@@ -1575,11 +1199,12 @@ impl Storage {
 
     /// Get a single item by primary key.
     pub fn get_item(&self, table_name: &str, pk: &str, sk: &str) -> Result<Option<String>> {
-        let sql = format!(
-            "SELECT item_json FROM \"{}\" WHERE pk = ?1 AND sk = ?2",
-            escape_table_name(table_name)
-        );
-        let result = self.conn.query_row(&sql, params![pk, sk], |row| row.get(0));
+        let (sql, params) = sql_builders::get_item(table_name, pk, sk);
+        let result = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                row.get(0)
+            });
 
         match result {
             Ok(json) => Ok(Some(json)),
@@ -1590,11 +1215,12 @@ impl Storage {
 
     /// Return the total item_size for all items sharing the given partition key.
     pub fn get_partition_size(&self, table_name: &str, pk: &str) -> Result<i64> {
-        let sql = format!(
-            "SELECT COALESCE(SUM(item_size), 0) FROM \"{}\" WHERE pk = ?1",
-            escape_table_name(table_name)
-        );
-        let size: i64 = self.conn.query_row(&sql, params![pk], |row| row.get(0))?;
+        let (sql, params) = sql_builders::get_partition_size(table_name, pk);
+        let size: i64 =
+            self.conn
+                .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                    row.get(0)
+                })?;
         Ok(size)
     }
 
@@ -1606,12 +1232,12 @@ impl Storage {
         index_name: &str,
         pk: &str,
     ) -> Result<i64> {
-        let lsi_table_name = format!("{table_name}::lsi::{index_name}");
-        let sql = format!(
-            "SELECT COALESCE(SUM(length(item_json)), 0) FROM \"{}\" WHERE pk = ?1",
-            escape_table_name(&lsi_table_name)
-        );
-        let size: i64 = self.conn.query_row(&sql, params![pk], |row| row.get(0))?;
+        let (sql, params) = sql_builders::get_lsi_partition_size(table_name, index_name, pk);
+        let size: i64 =
+            self.conn
+                .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                    row.get(0)
+                })?;
         Ok(size)
     }
 
@@ -1619,11 +1245,9 @@ impl Storage {
     pub fn delete_item(&self, table_name: &str, pk: &str, sk: &str) -> Result<Option<String>> {
         let old_item = self.get_item(table_name, pk, sk)?;
 
-        let sql = format!(
-            "DELETE FROM \"{}\" WHERE pk = ?1 AND sk = ?2",
-            escape_table_name(table_name)
-        );
-        self.conn.execute(&sql, params![pk, sk])?;
+        let (sql, params) = sql_builders::delete_item(table_name, pk, sk);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
 
         Ok(old_item)
     }
@@ -1638,47 +1262,10 @@ impl Storage {
         pk: &str,
         params: &QueryParams,
     ) -> Result<Vec<(String, String, String)>> {
-        let mut sql = format!(
-            "SELECT pk, sk, item_json FROM \"{}\" WHERE pk = ?1",
-            escape_table_name(table_name)
-        );
-
-        let mut param_idx = 2;
-        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(pk.to_string())];
-
-        if let Some(cond) = params.sk_condition {
-            sql.push(' ');
-            sql.push_str(cond);
-            for &p in params.sk_params {
-                all_params.push(Box::new(p.to_string()));
-                param_idx += 1;
-            }
-        }
-
-        if let Some(start_sk) = params.exclusive_start_sk {
-            if params.forward {
-                sql.push_str(&format!(" AND sk > ?{param_idx}"));
-            } else {
-                sql.push_str(&format!(" AND sk < ?{param_idx}"));
-            }
-            all_params.push(Box::new(start_sk.to_string()));
-        }
-
-        sql.push_str(if params.forward {
-            " ORDER BY sk ASC"
-        } else {
-            " ORDER BY sk DESC"
-        });
-
-        if let Some(lim) = params.limit {
-            sql.push_str(&format!(" LIMIT {lim}"));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            all_params.iter().map(|p| p.as_ref()).collect();
+        let (sql, params_vec) = sql_builders::query_items(table_name, pk, params);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
+            .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1695,77 +1282,10 @@ impl Storage {
         table_name: &str,
         params: &ScanParams,
     ) -> Result<Vec<(String, String, String)>> {
-        let mut sql = format!(
-            "SELECT pk, sk, item_json FROM \"{}\"",
-            escape_table_name(table_name)
-        );
-
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut where_clauses = Vec::new();
-        let mut param_idx = 1;
-
-        // For parallel scan with hash_prefix-based segment filtering
-        let is_parallel = params.segment.is_some() && params.total_segments.is_some();
-
-        if let (Some(start_pk), Some(start_sk)) =
-            (params.exclusive_start_pk, params.exclusive_start_sk)
-        {
-            if is_parallel {
-                // For parallel scans, pagination must respect hash_prefix ordering
-                where_clauses.push(format!(
-                    "(hash_prefix, pk, sk) > ((SELECT hash_prefix FROM \"{}\" WHERE pk = ?{} AND sk = ?{} LIMIT 1), ?{}, ?{})",
-                    escape_table_name(table_name),
-                    param_idx, param_idx + 1,
-                    param_idx, param_idx + 1
-                ));
-            } else {
-                where_clauses.push(format!("(pk, sk) > (?{}, ?{})", param_idx, param_idx + 1));
-            }
-            params_vec.push(Box::new(start_pk.to_string()));
-            params_vec.push(Box::new(start_sk.to_string()));
-            param_idx += 2;
-        }
-
-        if let (Some(seg), Some(total)) = (params.segment, params.total_segments) {
-            // Use hash_prefix column for segment assignment.
-            // Bucket = parseInt(hash_prefix[0..3], 16).
-            // Segment owns buckets from ceil(4096*seg/total) to ceil(4096*(seg+1)/total)-1.
-            let start_bucket = ceiling_div(HASH_BUCKETS * seg, total);
-            let end_bucket = ceiling_div(HASH_BUCKETS * (seg + 1), total) - 1;
-            let start_hex = format!("{:03x}", start_bucket);
-            let end_hex = format!("{:03x}", end_bucket);
-            // hash_prefix is a 6-char hex string; compare the first 3 chars
-            where_clauses.push(format!(
-                "substr(hash_prefix, 1, 3) >= ?{} AND substr(hash_prefix, 1, 3) <= ?{}",
-                param_idx,
-                param_idx + 1
-            ));
-            params_vec.push(Box::new(start_hex));
-            params_vec.push(Box::new(end_hex));
-        }
-
-        if !where_clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_clauses.join(" AND "));
-        }
-
-        // For parallel scans, order by hash_prefix for dynalite-compatible behaviour.
-        // For regular scans, use pk/sk ordering.
-        if is_parallel {
-            sql.push_str(" ORDER BY hash_prefix ASC, pk ASC, sk ASC");
-        } else {
-            sql.push_str(" ORDER BY pk ASC, sk ASC");
-        }
-
-        if let Some(lim) = params.limit {
-            sql.push_str(&format!(" LIMIT {lim}"));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
+        let (sql, params_vec) = sql_builders::scan_items(table_name, params);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
+            .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1775,8 +1295,12 @@ impl Storage {
 
     /// Count items in a table.
     pub fn count_items(&self, table_name: &str) -> Result<i64> {
-        let sql = format!("SELECT COUNT(*) FROM \"{}\"", escape_table_name(table_name));
-        let count: i64 = self.conn.query_row(&sql, [], |row| row.get(0))?;
+        let (sql, params) = sql_builders::count_items(table_name);
+        let count: i64 =
+            self.conn
+                .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                    row.get(0)
+                })?;
         Ok(count)
     }
 
@@ -2044,7 +1568,8 @@ impl Storage {
     /// List tables that have streams enabled.
     pub fn list_stream_enabled_tables(&self) -> Result<Vec<TableMetadata>> {
         let sql = format!(
-            "SELECT {TABLE_METADATA_COLUMNS} FROM _tables WHERE stream_enabled = 1 ORDER BY table_name"
+            "SELECT {} FROM _tables WHERE stream_enabled = 1 ORDER BY table_name",
+            sql_builders::TABLE_METADATA_COLUMNS
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
@@ -2075,7 +1600,8 @@ impl Storage {
     /// List tables that have TTL enabled.
     pub fn list_ttl_enabled_tables(&self) -> Result<Vec<TableMetadata>> {
         let sql = format!(
-            "SELECT {TABLE_METADATA_COLUMNS} FROM _tables WHERE ttl_enabled = 1 ORDER BY table_name"
+            "SELECT {} FROM _tables WHERE ttl_enabled = 1 ORDER BY table_name",
+            sql_builders::TABLE_METADATA_COLUMNS
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
@@ -2180,11 +1706,6 @@ pub struct TableInfoEntry {
     pub metadata: Option<TableMetadata>,
 }
 
-/// Escape double quotes in table names for safe SQL identifier use.
-pub(crate) fn escape_table_name(name: &str) -> String {
-    name.replace('"', "\"\"")
-}
-
 /// Metadata row from the `_tables` table.
 ///
 /// Note: The `tags` column is intentionally excluded. Tags are not on the hot
@@ -2215,19 +1736,8 @@ pub struct TableMetadata {
     pub table_id: Option<String>,
 }
 
-/// The standard SELECT column list for _tables queries.
-///
-/// Columns are named explicitly (never `SELECT *`) and decoded positionally in
-/// `row_to_metadata`, so this order is load-bearing: append new columns at the
-/// end only. Keeping the projection explicit is also what lets an older binary
-/// read a database written by a newer one - the extra trailing column is simply
-/// not selected.
-const TABLE_METADATA_COLUMNS: &str = "table_name, key_schema, attribute_definitions, gsi_definitions, \
-     lsi_definitions, stream_enabled, stream_view_type, stream_label, ttl_attribute, ttl_enabled, \
-     created_at, table_status, billing_mode, provisioned_throughput, \
-     sse_specification, table_class, deletion_protection_enabled, on_demand_throughput, table_id";
-
 /// Map a row from the _tables SELECT to a TableMetadata struct.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 fn row_to_metadata(row: &rusqlite::Row) -> rusqlite::Result<TableMetadata> {
     Ok(TableMetadata {
         table_name: row.get(0)?,
@@ -2252,7 +1762,7 @@ fn row_to_metadata(row: &rusqlite::Row) -> rusqlite::Result<TableMetadata> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]
 mod tests {
     use super::*;
 

@@ -89,6 +89,7 @@ pub enum DynoxideError {
     ConversionError(#[from] crate::types::ConversionError),
 
     /// SQLite error (converted from rusqlite).
+    #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
     #[error("Internal error: {0}")]
     SqliteError(#[from] rusqlite::Error),
 }
@@ -159,9 +160,11 @@ impl DynoxideError {
                 "com.amazonaws.dynamodb.v20120810#IdempotentParameterMismatchException"
             }
             DynoxideError::ConversionError(_) => "com.amazon.coral.validate#ValidationException",
-            DynoxideError::InternalServerError(_) | DynoxideError::SqliteError(_) => {
+            DynoxideError::InternalServerError(_) => {
                 "com.amazonaws.dynamodb.v20120810#InternalServerError"
             }
+            #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+            DynoxideError::SqliteError(_) => "com.amazonaws.dynamodb.v20120810#InternalServerError",
         }
     }
 
@@ -189,16 +192,18 @@ impl DynoxideError {
             DynoxideError::IdempotentParameterMismatchException(_) => "IdempotentParameterMismatch",
             DynoxideError::SerializationException(_) => "SerializationError",
             DynoxideError::LimitExceededException(_) => "RequestLimitExceeded",
-            DynoxideError::InternalServerError(_) | DynoxideError::SqliteError(_) => {
-                "InternalServerError"
-            }
+            DynoxideError::InternalServerError(_) => "InternalServerError",
+            #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+            DynoxideError::SqliteError(_) => "InternalServerError",
         }
     }
 
     /// Returns the HTTP status code for this error.
     pub fn status_code(&self) -> u16 {
         match self {
-            DynoxideError::InternalServerError(_) | DynoxideError::SqliteError(_) => 500,
+            DynoxideError::InternalServerError(_) => 500,
+            #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+            DynoxideError::SqliteError(_) => 500,
             _ => 400,
         }
     }
@@ -330,12 +335,55 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
     #[test]
     fn test_sqlite_error_maps_to_internal() {
         let sqlite_err = rusqlite::Error::QueryReturnedNoRows;
         let err = DynoxideError::from(sqlite_err);
         assert_eq!(err.status_code(), 500);
         assert!(err.error_type().contains("InternalServerError"));
+    }
+
+    // Error-envelope fidelity for the wasm backend.
+    //
+    // Client-facing envelopes (ResourceNotFound, ConditionalCheckFailed,
+    // Validation, ...) are raised by the shared, generic action handlers, so
+    // they are backend-independent by construction. The only backend-specific
+    // boundary is `From<BackendError> for DynoxideError`, exercised here: the
+    // wasm backend's storage faults must land on the same envelopes the native
+    // rusqlite path produces.
+    #[test]
+    fn test_backend_error_envelopes_match_native() {
+        use crate::storage_backend::BackendError;
+
+        // A client-facing validation limit crosses the boundary as a 400.
+        let v: DynoxideError = BackendError::Validation("too many tags".into()).into();
+        assert_eq!(v.status_code(), 400);
+        assert_eq!(
+            v.error_type(),
+            "com.amazon.coral.validate#ValidationException"
+        );
+
+        // Unsupported (e.g. TTL on wasm) surfaces as a 500 carrying the
+        // capability tag, the documented AWS-style code for the preview.
+        let u: DynoxideError = BackendError::Unsupported { capability: "ttl" }.into();
+        assert_eq!(u.status_code(), 500);
+        assert!(u.error_type().contains("InternalServerError"));
+        assert!(u.to_string().contains("ttl"));
+
+        // Every other storage fault maps to a 500, matching the native
+        // `rusqlite::Error -> SqliteError -> InternalServerError` path.
+        for e in [
+            BackendError::NotADatabase,
+            BackendError::Locked,
+            BackendError::Constraint("constraint".into()),
+            BackendError::Io("io".into()),
+            BackendError::Other("wa-sqlite: boom".into()),
+        ] {
+            let d: DynoxideError = e.into();
+            assert_eq!(d.status_code(), 500);
+            assert!(d.error_type().contains("InternalServerError"));
+        }
     }
 
     #[test]
