@@ -195,6 +195,8 @@ fn row_to_metadata(row: &js_sys::Array) -> TableMetadata {
         sse_specification: col_text(row, 14),
         table_class: col_text(row, 15),
         deletion_protection_enabled: col_i64(row, 16) != 0,
+        on_demand_throughput: col_text(row, 17),
+        table_id: col_text(row, 18),
     }
 }
 
@@ -273,6 +275,22 @@ impl StorageBackend for WasmBridgeBackend {
         _billing_mode: &str,
     ) -> Result<(), BackendError> {
         Err(unsupported("update_billing_mode"))
+    }
+
+    async fn update_table_class(
+        &self,
+        _table_name: &str,
+        _table_class: &str,
+    ) -> Result<(), BackendError> {
+        Err(unsupported("update_table_class"))
+    }
+
+    async fn update_on_demand_throughput(
+        &self,
+        _table_name: &str,
+        _on_demand_throughput: &str,
+    ) -> Result<(), BackendError> {
+        Err(unsupported("update_on_demand_throughput"))
     }
 
     async fn get_tags(&self, _table_name: &str) -> Result<Vec<Tag>, BackendError> {

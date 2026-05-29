@@ -93,7 +93,7 @@ pub fn escape_table_name(name: &str) -> String {
 pub(crate) const TABLE_METADATA_COLUMNS: &str = "table_name, key_schema, attribute_definitions, gsi_definitions, \
      lsi_definitions, stream_enabled, stream_view_type, stream_label, ttl_attribute, ttl_enabled, \
      created_at, table_status, billing_mode, provisioned_throughput, \
-     sse_specification, table_class, deletion_protection_enabled";
+     sse_specification, table_class, deletion_protection_enabled, on_demand_throughput, table_id";
 
 /// Idempotent schema bootstrap shared by both backends: the metadata, config,
 /// and stream-record tables at the current schema version. Native
@@ -123,7 +123,9 @@ pub const INIT_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS _config (
                 tags TEXT,
                 sse_specification TEXT,
                 table_class TEXT,
-                deletion_protection_enabled INTEGER DEFAULT 0
+                deletion_protection_enabled INTEGER DEFAULT 0,
+                on_demand_throughput TEXT,
+                table_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS _stream_records (
@@ -151,12 +153,19 @@ pub const ROLLBACK: &str = "ROLLBACK";
 // --- Table metadata (`_tables`) -----------------------------------------
 
 /// Insert a metadata row into `_tables`.
+///
+/// The TableId is assigned once, here, at create time and never changes for
+/// this incarnation of the table. AWS uses a random v4 UUID; a recreated table
+/// gets a fresh one, so a drop + recreate yields a different id even within the
+/// same second, matching AWS. Generating it in the shared builder keeps both
+/// backends in step. See #55.
 pub fn insert_table_metadata<'a>(m: &CreateTableMetadata<'a>) -> (String, Vec<SqlParam<'a>>) {
+    let table_id = uuid::Uuid::new_v4().to_string();
     let sql =
         "INSERT INTO _tables (table_name, key_schema, attribute_definitions, gsi_definitions, \
          lsi_definitions, provisioned_throughput, created_at, sse_specification, table_class, \
-         deletion_protection_enabled, billing_mode) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+         deletion_protection_enabled, billing_mode, on_demand_throughput, table_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
             .to_string();
     let params = vec![
         SqlParam::text(m.table_name),
@@ -170,6 +179,8 @@ pub fn insert_table_metadata<'a>(m: &CreateTableMetadata<'a>) -> (String, Vec<Sq
         SqlParam::opt_text(m.table_class),
         SqlParam::Integer(m.deletion_protection_enabled as i64),
         SqlParam::opt_text(m.billing_mode),
+        SqlParam::opt_text(m.on_demand_throughput),
+        SqlParam::text(table_id),
     ];
     (sql, params)
 }
@@ -885,11 +896,17 @@ mod tests {
         };
         let (sql, params) = insert_table_metadata(&m);
         assert!(sql.starts_with("INSERT INTO _tables"));
-        assert_eq!(params.len(), 11);
+        assert_eq!(params.len(), 13);
         assert_eq!(params[0], SqlParam::text("T"));
         assert_eq!(params[3], SqlParam::Null); // gsi_definitions: None
         assert_eq!(params[6], SqlParam::Integer(7)); // created_at
         assert_eq!(params[9], SqlParam::Integer(1)); // deletion_protection_enabled
+        assert_eq!(params[11], SqlParam::Null); // on_demand_throughput: None
+        // table_id is a freshly generated v4 UUID, so assert its shape, not value.
+        match &params[12] {
+            SqlParam::Text(id) => assert_eq!(id.len(), 36),
+            other => panic!("table_id should be bound as text, got {other:?}"),
+        }
     }
 
     #[test]

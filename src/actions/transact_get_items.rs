@@ -171,10 +171,22 @@ pub async fn execute<S: StorageBackend>(
                     key_attrs.push(sk.clone());
                 }
 
-                let projected =
-                    expressions::projection::apply(&item, &projection, &tracker, &key_attrs)
-                        .map_err(DynoxideError::ValidationException)?;
-                Some(projected)
+                // AWS omits `Item` entirely when a ProjectionExpression matches
+                // no attribute on an otherwise-present item. `projection::apply`
+                // always re-injects the key attributes, so its result is never
+                // literally empty. Apply the projection without those keys to
+                // see whether any path actually resolved, then return the
+                // key-bearing result only when one did.
+                let matched = expressions::projection::apply(&item, &projection, &tracker, &[])
+                    .map_err(DynoxideError::ValidationException)?;
+                if matched.is_empty() {
+                    None
+                } else {
+                    let projected =
+                        expressions::projection::apply(&item, &projection, &tracker, &key_attrs)
+                            .map_err(DynoxideError::ValidationException)?;
+                    Some(projected)
+                }
             } else {
                 None
             }
@@ -192,20 +204,26 @@ pub async fn execute<S: StorageBackend>(
         request.return_consumed_capacity.as_deref(),
         Some("TOTAL") | Some("INDEXES")
     ) {
-        let mut table_sizes: std::collections::HashMap<String, usize> =
+        // AWS charges 2 RCU per requested item for a transactional read,
+        // including items that turned out to be missing (a missing item has
+        // size 0, which still rounds up to 1 RCU before the 2x factor). Round
+        // each item up to whole read units first, then double, then sum per
+        // table, so a boundary-straddling item is not undercharged.
+        let mut table_units: std::collections::HashMap<String, f64> =
             std::collections::HashMap::new();
         for (resp, req_item) in responses.iter().zip(request.transact_items.iter()) {
             let size = resp.item.as_ref().map(crate::types::item_size).unwrap_or(0);
-            *table_sizes
+            *table_units
                 .entry(req_item.get.table_name.clone())
-                .or_default() += size;
+                .or_default() += crate::types::TRANSACTIONAL_CAPACITY_FACTOR
+                * crate::types::read_capacity_units_with_consistency(size, true);
         }
-        let caps: Vec<_> = table_sizes
+        let caps: Vec<_> = table_units
             .iter()
-            .filter_map(|(table, &size)| {
-                crate::types::consumed_capacity(
+            .filter_map(|(table, &units)| {
+                crate::types::transactional_read_capacity(
                     table,
-                    crate::types::read_capacity_units_with_consistency(size, true),
+                    units,
                     &request.return_consumed_capacity,
                 )
             })

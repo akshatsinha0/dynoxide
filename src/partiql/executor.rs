@@ -20,13 +20,26 @@ pub async fn execute<S: StorageBackend>(
     parameters: &[AttributeValue],
     limit: Option<usize>,
 ) -> Result<Option<Vec<Item>>> {
+    Ok(execute_measured(storage, stmt, parameters, limit).await?.0)
+}
+
+/// Like [`execute`], but also returns the total item byte size the statement
+/// touched, for `ConsumedCapacity` accounting. SELECT reports the summed size of
+/// the rows returned; INSERT/UPDATE/DELETE report the affected item's size (0
+/// when the statement was a no-op, e.g. a missing DELETE target).
+pub async fn execute_measured<S: StorageBackend>(
+    storage: &S,
+    stmt: &Statement,
+    parameters: &[AttributeValue],
+    limit: Option<usize>,
+) -> Result<(Option<Vec<Item>>, usize)> {
     match stmt {
         Statement::Select {
             table_name,
             projections,
             where_clause,
         } => {
-            execute_select(
+            let items = execute_select(
                 storage,
                 table_name,
                 projections,
@@ -34,15 +47,21 @@ pub async fn execute<S: StorageBackend>(
                 parameters,
                 limit,
             )
-            .await
+            .await?;
+            let size = items
+                .as_ref()
+                .map(|rows| rows.iter().map(crate::types::item_size).sum())
+                .unwrap_or(0);
+            Ok((items, size))
         }
         Statement::Insert {
             table_name,
             item,
             if_not_exists,
         } => {
-            execute_insert(storage, table_name, item, parameters, *if_not_exists).await?;
-            Ok(None)
+            let size =
+                execute_insert(storage, table_name, item, parameters, *if_not_exists).await?;
+            Ok((None, size))
         }
         Statement::Update {
             table_name,
@@ -50,7 +69,7 @@ pub async fn execute<S: StorageBackend>(
             remove_paths,
             where_clause,
         } => {
-            execute_update(
+            let size = execute_update(
                 storage,
                 table_name,
                 set_clauses,
@@ -59,14 +78,15 @@ pub async fn execute<S: StorageBackend>(
                 parameters,
             )
             .await?;
-            Ok(None)
+            Ok((None, size))
         }
         Statement::Delete {
             table_name,
             where_clause,
         } => {
-            execute_delete(storage, table_name, where_clause.as_ref(), parameters).await?;
-            Ok(None)
+            let size =
+                execute_delete(storage, table_name, where_clause.as_ref(), parameters).await?;
+            Ok((None, size))
         }
     }
 }
@@ -211,13 +231,15 @@ fn find_pk_condition<'a>(
     }
 }
 
+/// Returns the inserted item's size in bytes (0 when an `if_not_exists`
+/// duplicate makes the insert a no-op), for `ConsumedCapacity` accounting.
 async fn execute_insert<S: StorageBackend>(
     storage: &S,
     table_name: &str,
     item_template: &HashMap<String, PartiqlValue>,
     parameters: &[AttributeValue],
     if_not_exists: bool,
-) -> Result<()> {
+) -> Result<usize> {
     // Resolve any parameter placeholders in the item
     let mut item = HashMap::new();
     for (k, v) in item_template {
@@ -251,7 +273,7 @@ async fn execute_insert<S: StorageBackend>(
     if existing.is_some() {
         if if_not_exists {
             // Silently succeed — no-op
-            return Ok(());
+            return Ok(0);
         }
         return Err(DynoxideError::DuplicateItemException(
             "Duplicate primary key exists in table".to_string(),
@@ -301,9 +323,11 @@ async fn execute_insert<S: StorageBackend>(
     let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
 
-    Ok(())
+    Ok(item_size)
 }
 
+/// Returns the updated item's new size in bytes (0 when the update resolves to
+/// an empty item and is skipped), for `ConsumedCapacity` accounting.
 async fn execute_update<S: StorageBackend>(
     storage: &S,
     table_name: &str,
@@ -311,7 +335,7 @@ async fn execute_update<S: StorageBackend>(
     remove_paths: &[String],
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
-) -> Result<()> {
+) -> Result<usize> {
     let meta = require_table(storage, table_name).await?;
     let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
 
@@ -331,7 +355,8 @@ async fn execute_update<S: StorageBackend>(
     let pk_cond =
         find_comparison_in_groups(&wc.groups, &key_schema.partition_key).ok_or_else(|| {
             DynoxideError::ValidationException(
-                "UPDATE WHERE must include partition key equality".to_string(),
+                "Where clause does not contain a mandatory equality on all key attributes"
+                    .to_string(),
             )
         })?;
 
@@ -366,6 +391,17 @@ async fn execute_update<S: StorageBackend>(
 
     let old_item = item.clone();
 
+    // Non-key WHERE predicates act as a condition on the existing item, like a
+    // conditional write. When the item exists but the condition is false, AWS
+    // raises ConditionalCheckFailedException; a missing item is not a condition
+    // failure and falls through to the existing create/no-op behaviour below.
+    if existing_json.is_some() && !matches_where(&old_item, where_clause, parameters) {
+        return Err(DynoxideError::ConditionalCheckFailedException(
+            "The conditional request failed".to_string(),
+            None,
+        ));
+    }
+
     // Apply SET clauses with nested path support
     for clause in set_clauses {
         let val = resolve_set_value(&clause.value, &item, parameters)?;
@@ -379,7 +415,7 @@ async fn execute_update<S: StorageBackend>(
 
     // Ensure keys are present
     if item.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     // Validate attribute values after SET clauses applied
@@ -440,15 +476,17 @@ async fn execute_update<S: StorageBackend>(
     };
     crate::streams::record_stream_event(storage, &meta, old_ref, Some(&item)).await?;
 
-    Ok(())
+    Ok(item_size)
 }
 
+/// Returns the deleted item's size in bytes (0 when the target was missing and
+/// the delete was a no-op), for `ConsumedCapacity` accounting.
 async fn execute_delete<S: StorageBackend>(
     storage: &S,
     table_name: &str,
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
-) -> Result<()> {
+) -> Result<usize> {
     let meta = require_table(storage, table_name).await?;
     let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
 
@@ -466,7 +504,8 @@ async fn execute_delete<S: StorageBackend>(
     let pk_cond =
         find_comparison_in_groups(&wc.groups, &key_schema.partition_key).ok_or_else(|| {
             DynoxideError::ValidationException(
-                "DELETE WHERE must include partition key equality".to_string(),
+                "Where clause does not contain a mandatory equality on all key attributes"
+                    .to_string(),
             )
         })?;
 
@@ -501,6 +540,23 @@ async fn execute_delete<S: StorageBackend>(
         String::new()
     };
 
+    // Non-key WHERE predicates act as a condition on the existing item, like a
+    // conditional write. AWS raises ConditionalCheckFailedException when the item
+    // is present but the condition is false, and a missing item is a silent
+    // no-op (the condition is never evaluated). Re-running the full WHERE via
+    // matches_where covers both the key equality (always true for the fetched
+    // item) and any extra predicates.
+    if let Some(json) = storage.get_item(table_name, &pk_str, &sk_str).await? {
+        let existing: Item = serde_json::from_str(&json)
+            .map_err(|e| DynoxideError::InternalServerError(format!("Bad item JSON: {e}")))?;
+        if !matches_where(&existing, where_clause, parameters) {
+            return Err(DynoxideError::ConditionalCheckFailedException(
+                "The conditional request failed".to_string(),
+                None,
+            ));
+        }
+    }
+
     let old_json = storage.delete_item(table_name, &pk_str, &sk_str).await?;
 
     // GSI maintenance
@@ -519,7 +575,10 @@ async fn execute_delete<S: StorageBackend>(
         crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None).await?;
     }
 
-    Ok(())
+    // A delete is charged for the size of the item it removed; a no-op delete
+    // (missing target) reports 0.
+    let deleted_size = old_item.as_ref().map(crate::types::item_size).unwrap_or(0);
+    Ok(deleted_size)
 }
 
 // ---------------------------------------------------------------------------
@@ -780,6 +839,23 @@ fn matches_conditions(
                         }
                     }
                     _ => return false,
+                }
+            }
+            WhereCondition::NotBeginsWith(path, prefix_val) => {
+                // Logical negation of begins_with: the row matches unless the
+                // value is a string that starts with the prefix. A missing or
+                // non-string attribute does not begin with the prefix, so it is
+                // kept.
+                if let Some(item_val) = resolve_nested_path(item, path) {
+                    let prefix = match resolve_value(prefix_val, parameters) {
+                        Ok(v) => v,
+                        Err(_) => return false,
+                    };
+                    if let (AttributeValue::S(s), AttributeValue::S(p)) = (item_val, &prefix) {
+                        if s.starts_with(p.as_str()) {
+                            return false;
+                        }
+                    }
                 }
             }
             WhereCondition::Between(path, low, high) => {

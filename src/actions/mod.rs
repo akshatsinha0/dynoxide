@@ -115,6 +115,9 @@ pub struct TableDescription {
         skip_serializing_if = "Option::is_none"
     )]
     pub deletion_protection_enabled: Option<bool>,
+
+    #[serde(rename = "OnDemandThroughput", skip_serializing_if = "Option::is_none")]
+    pub on_demand_throughput: Option<crate::types::OnDemandThroughput>,
 }
 
 /// SSE description returned in TableDescription.
@@ -230,9 +233,22 @@ pub struct LocalSecondaryIndexDescription {
     pub index_size_bytes: Option<i64>,
 }
 
-/// Generate a UUID v4 for TableId.
-fn generate_table_id() -> String {
-    uuid::Uuid::new_v4().to_string()
+/// Deterministic fallback `TableId` for a table that has no persisted id.
+///
+/// The primary scheme persists a random v4 UUID assigned at create time (see
+/// `Storage::insert_table_metadata` and the v8 migration's backfill), matching
+/// AWS: stable across reads, and a new id for a dropped-and-recreated table.
+/// This fallback only applies to a row whose stored `table_id` is `None` — for
+/// example one written by an older binary into a newer database. It derives a
+/// stable UUID (v5) from the table name and creation timestamp so such a row
+/// still reports a consistent id across reads, rather than the per-call random
+/// value that #55 fixed.
+fn table_id_for(table_name: &str, created_at: i64) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("dynoxide:table:{table_name}:{created_at}").as_bytes(),
+    )
+    .to_string()
 }
 
 /// Helper: Build a TableDescription from stored metadata.
@@ -376,18 +392,35 @@ pub(crate) fn build_table_description(
         None
     };
 
-    // Build SSE description from stored specification
+    // Build SSE description from stored specification. When encryption is
+    // enabled, AWS reports SSEType=KMS and a KMS key ARN even if the request
+    // only set Enabled=true, so default those here rather than dropping them.
     let sse_description = meta.sse_specification.as_ref().and_then(|json| {
         serde_json::from_str::<crate::types::SseSpecification>(json)
             .ok()
-            .map(|spec| SseDescription {
-                status: if spec.enabled.unwrap_or(false) {
-                    "ENABLED".to_string()
-                } else {
-                    "DISABLED".to_string()
-                },
-                sse_type: spec.sse_type,
-                kms_master_key_arn: spec.kms_master_key_id,
+            .map(|spec| {
+                let enabled = spec.enabled.unwrap_or(false);
+                SseDescription {
+                    status: if enabled { "ENABLED" } else { "DISABLED" }.to_string(),
+                    sse_type: if enabled {
+                        spec.sse_type.or_else(|| Some("KMS".to_string()))
+                    } else {
+                        spec.sse_type
+                    },
+                    kms_master_key_arn: if enabled {
+                        // New tables persist a synthesised key id at create time;
+                        // fall back to a table-derived key for any older row that
+                        // enabled SSE without one, so the ARN stays stable across
+                        // repeated DescribeTable calls rather than changing each read.
+                        Some(
+                            spec.kms_master_key_id
+                                .map(|id| streams::kms_key_arn(&id))
+                                .unwrap_or_else(|| streams::kms_key_arn(table_name)),
+                        )
+                    } else {
+                        None
+                    },
+                }
             })
     });
 
@@ -395,11 +428,20 @@ pub(crate) fn build_table_description(
         table_class: tc.clone(),
     });
 
+    let on_demand_throughput = meta
+        .on_demand_throughput
+        .as_ref()
+        .and_then(|json| serde_json::from_str::<crate::types::OnDemandThroughput>(json).ok());
+
     let deletion_protection_enabled = Some(meta.deletion_protection_enabled);
 
     TableDescription {
         table_name: meta.table_name.clone(),
-        table_id: Some(generate_table_id()),
+        table_id: Some(
+            meta.table_id
+                .clone()
+                .unwrap_or_else(|| table_id_for(&meta.table_name, meta.created_at)),
+        ),
         table_arn: streams::table_arn(table_name),
         table_status: meta.table_status.clone(),
         key_schema,
@@ -430,5 +472,6 @@ pub(crate) fn build_table_description(
         sse_description,
         table_class_summary,
         deletion_protection_enabled,
+        on_demand_throughput,
     }
 }

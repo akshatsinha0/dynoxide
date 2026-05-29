@@ -12,7 +12,7 @@ use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
 /// Current schema version. Stored in the `_config` table for future migrations.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
-const SCHEMA_VERSION: &str = "6";
+const SCHEMA_VERSION: &str = "8";
 
 /// Number of hash buckets used for parallel scan segment assignment.
 /// Matches dynalite's implementation.
@@ -219,6 +219,7 @@ pub struct CreateTableMetadata<'a> {
     pub table_class: Option<&'a str>,
     pub deletion_protection_enabled: bool,
     pub billing_mode: Option<&'a str>,
+    pub on_demand_throughput: Option<&'a str>,
 }
 
 /// Parameters for query operations (base table or GSI).
@@ -410,6 +411,12 @@ impl Storage {
         if version < 6 {
             self.migrate_v5_to_v6()?;
         }
+        if version < 7 {
+            self.migrate_v6_to_v7()?;
+        }
+        if version < 8 {
+            self.migrate_v7_to_v8()?;
+        }
 
         Ok(())
     }
@@ -545,6 +552,59 @@ impl Storage {
         Ok(())
     }
 
+    /// Migrate from schema v6 to v7: add `on_demand_throughput TEXT` column to `_tables`.
+    fn migrate_v6_to_v7(&self) -> Result<()> {
+        let _ = self.conn.execute(
+            "ALTER TABLE _tables ADD COLUMN on_demand_throughput TEXT",
+            [],
+        );
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', '7')",
+            [],
+        )?;
+
+        Ok(())
+    }
+
+    /// Migrate from schema v7 to v8: add a `table_id TEXT` column to `_tables`
+    /// and backfill existing tables with a one-time random UUID.
+    ///
+    /// TableId must stay stable between reads of the same table (#55). New
+    /// tables get their id at insert time; tables created before this column
+    /// existed are assigned a persisted id here, once. The backfill `SELECT`
+    /// references `table_id`, so if the `ALTER` did not actually add the column
+    /// (a genuine failure, swallowed below for the duplicate-column re-run case)
+    /// this step errors out before the version is stamped, rather than stamping
+    /// a half-applied migration.
+    fn migrate_v7_to_v8(&self) -> Result<()> {
+        let _ = self
+            .conn
+            .execute("ALTER TABLE _tables ADD COLUMN table_id TEXT", []);
+
+        let names: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT table_name FROM _tables WHERE table_id IS NULL")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<String>>>()?
+        };
+        for name in names {
+            let id = uuid::Uuid::new_v4().to_string();
+            self.conn.execute(
+                "UPDATE _tables SET table_id = ?1 WHERE table_name = ?2",
+                params![id, name],
+            )?;
+        }
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', '8')",
+            [],
+        )?;
+
+        Ok(())
+    }
+
     /// Get a reference to the underlying connection (for transactions, etc.).
     pub fn conn(&self) -> &Connection {
         &self.conn
@@ -651,6 +711,30 @@ impl Storage {
         self.conn.execute(
             "UPDATE _tables SET billing_mode = ?1 WHERE table_name = ?2",
             params![billing_mode, table_name],
+        )?;
+        self.metadata_cache.borrow_mut().remove(table_name);
+        Ok(())
+    }
+
+    /// Update the table class for a table.
+    pub fn update_table_class(&self, table_name: &str, table_class: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE _tables SET table_class = ?1 WHERE table_name = ?2",
+            params![table_class, table_name],
+        )?;
+        self.metadata_cache.borrow_mut().remove(table_name);
+        Ok(())
+    }
+
+    /// Update the on-demand throughput (stored as JSON) for a table.
+    pub fn update_on_demand_throughput(
+        &self,
+        table_name: &str,
+        on_demand_throughput: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE _tables SET on_demand_throughput = ?1 WHERE table_name = ?2",
+            params![on_demand_throughput, table_name],
         )?;
         self.metadata_cache.borrow_mut().remove(table_name);
         Ok(())
@@ -1646,6 +1730,10 @@ pub struct TableMetadata {
     pub sse_specification: Option<String>,
     pub table_class: Option<String>,
     pub deletion_protection_enabled: bool,
+    pub on_demand_throughput: Option<String>,
+    /// Stable per-table identifier assigned at create time (#55). `None` only
+    /// for rows that predate the v8 migration's backfill.
+    pub table_id: Option<String>,
 }
 
 /// Map a row from the _tables SELECT to a TableMetadata struct.
@@ -1669,6 +1757,8 @@ fn row_to_metadata(row: &rusqlite::Row) -> rusqlite::Result<TableMetadata> {
         sse_specification: row.get(14)?,
         table_class: row.get(15)?,
         deletion_protection_enabled: row.get::<_, i32>(16).unwrap_or(0) != 0,
+        on_demand_throughput: row.get(17)?,
+        table_id: row.get(18)?,
     })
 }
 
@@ -1693,6 +1783,167 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_migrate_v6_to_v7_adds_on_demand_throughput_column() {
+        // Issue #44: the on_demand_throughput column must be added to existing
+        // on-disk databases through the versioned migration chain, not just the
+        // fresh CREATE — otherwise DescribeTable on a pre-existing table errors.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        // Build a v6-shape database by hand: _tables without on_demand_throughput,
+        // schema_version pinned at 6, and one pre-existing table row.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE _tables (
+                    table_name TEXT PRIMARY KEY,
+                    key_schema TEXT NOT NULL,
+                    attribute_definitions TEXT NOT NULL,
+                    gsi_definitions TEXT,
+                    lsi_definitions TEXT,
+                    stream_enabled INTEGER DEFAULT 0,
+                    stream_view_type TEXT,
+                    stream_label TEXT,
+                    ttl_attribute TEXT,
+                    ttl_enabled INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    table_status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    billing_mode TEXT DEFAULT 'PAY_PER_REQUEST',
+                    provisioned_throughput TEXT,
+                    tags TEXT,
+                    sse_specification TEXT,
+                    table_class TEXT,
+                    deletion_protection_enabled INTEGER DEFAULT 0
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _config (key, value) VALUES ('schema_version', '6')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _tables (table_name, key_schema, attribute_definitions, created_at) \
+                 VALUES ('LegacyTable', ?1, ?2, 0)",
+                params![
+                    r#"[{"AttributeName":"pk","KeyType":"HASH"}]"#,
+                    r#"[{"AttributeName":"pk","AttributeType":"S"}]"#,
+                ],
+            )
+            .unwrap();
+        }
+
+        // Reopening runs the migration chain; v6 -> v7 adds the column, and the
+        // chain continues to the current SCHEMA_VERSION.
+        let storage = Storage::new(&path).unwrap();
+        let version: String = storage
+            .conn()
+            .query_row(
+                "SELECT value FROM _config WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // The pre-existing row survives and reads back through row_to_metadata,
+        // with the new column present and NULL.
+        let meta = storage.get_table_metadata("LegacyTable").unwrap().unwrap();
+        assert_eq!(meta.table_name, "LegacyTable");
+        assert!(meta.on_demand_throughput.is_none());
+
+        // A bare SELECT of the new column would error if the ALTER had not run.
+        let col: Option<String> = storage
+            .conn()
+            .query_row(
+                "SELECT on_demand_throughput FROM _tables WHERE table_name = 'LegacyTable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(col.is_none());
+    }
+
+    /// #55: the v7 -> v8 migration adds the `table_id` column and backfills any
+    /// pre-existing table with a one-time random id, so a legacy table reports a
+    /// stable TableId from then on.
+    #[test]
+    fn test_migrate_v7_to_v8_backfills_table_id() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        // Build a v7-shape database by hand: _tables with on_demand_throughput
+        // but no table_id, schema_version pinned at 7, one pre-existing row.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE _tables (
+                    table_name TEXT PRIMARY KEY,
+                    key_schema TEXT NOT NULL,
+                    attribute_definitions TEXT NOT NULL,
+                    gsi_definitions TEXT,
+                    lsi_definitions TEXT,
+                    stream_enabled INTEGER DEFAULT 0,
+                    stream_view_type TEXT,
+                    stream_label TEXT,
+                    ttl_attribute TEXT,
+                    ttl_enabled INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    table_status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    billing_mode TEXT DEFAULT 'PAY_PER_REQUEST',
+                    provisioned_throughput TEXT,
+                    tags TEXT,
+                    sse_specification TEXT,
+                    table_class TEXT,
+                    deletion_protection_enabled INTEGER DEFAULT 0,
+                    on_demand_throughput TEXT
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _config (key, value) VALUES ('schema_version', '7')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _tables (table_name, key_schema, attribute_definitions, created_at) \
+                 VALUES ('LegacyTable', ?1, ?2, 0)",
+                params![
+                    r#"[{"AttributeName":"pk","KeyType":"HASH"}]"#,
+                    r#"[{"AttributeName":"pk","AttributeType":"S"}]"#,
+                ],
+            )
+            .unwrap();
+        }
+
+        // Reopening runs the migration chain through v8.
+        let storage = Storage::new(&path).unwrap();
+        let version: String = storage
+            .conn()
+            .query_row(
+                "SELECT value FROM _config WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // The legacy row was backfilled with a non-empty table_id, and it reads
+        // back through row_to_metadata.
+        let meta = storage.get_table_metadata("LegacyTable").unwrap().unwrap();
+        let id = meta.table_id.expect("legacy table should be backfilled");
+        assert!(!id.is_empty());
+
+        // Reopening again keeps the same id (stable, not regenerated).
+        drop(storage);
+        let storage2 = Storage::new(&path).unwrap();
+        let meta2 = storage2.get_table_metadata("LegacyTable").unwrap().unwrap();
+        assert_eq!(meta2.table_id.as_deref(), Some(id.as_str()));
     }
 
     #[test]
