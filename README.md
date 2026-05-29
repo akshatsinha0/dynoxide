@@ -228,7 +228,7 @@ npm run build:wasm
 
 | File | Size | What |
 |---|---|---|
-| `dynoxide_bg.wasm` | ~530 KB | the engine (release, wasm-opt) |
+| `dynoxide_bg.wasm` | ~550 KB | the engine (release, wasm-opt) |
 | `wa-sqlite.wasm` | ~545 KB | SQLite (the synchronous build) |
 | `dynoxide-worker.js` | ~120 KB | the bundled Web Worker (wa-sqlite glue + bridge) |
 
