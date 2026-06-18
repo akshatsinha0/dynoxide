@@ -93,11 +93,9 @@ pub enum DynoxideError {
     #[error("Internal error: {0}")]
     SqliteError(#[from] rusqlite::Error),
 
-    /// OPFS is present in the browser but its pool could not be acquired,
-    /// typically because another tab or Worker holds the database's sync access
-    /// handles. wasm backend only; surfaced with a dynoxide-specific `__type` so
-    /// a browser client can detect a busy database rather than parse a generic
-    /// internal error.
+    /// OPFS is present in the browser but its pool could not be acquired
+    /// (typically another tab holds the database). wasm backend only; carries a
+    /// dynoxide-specific `__type` so a client can detect a busy database.
     #[cfg(feature = "wasm-sqlite")]
     #[error("{0}")]
     OpfsUnavailable(String),

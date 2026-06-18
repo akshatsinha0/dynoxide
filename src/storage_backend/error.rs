@@ -56,12 +56,10 @@ pub enum BackendError {
         capability: &'static str,
     },
 
-    /// OPFS is present but its pool could not be acquired - typically another
-    /// tab or Worker holds the database's sync access handles. Produced only by
-    /// the wasm backend; carries the bridge's guidance message. Restored by
+    /// OPFS is present but its pool could not be acquired - typically another tab
+    /// holds the database's sync access handles. wasm backend only; restored by
     /// `From<BackendError> for DynoxideError` to a stable
-    /// `com.dynoxide.wasm#OpfsUnavailable` envelope so a browser client can
-    /// prompt the user to close the other session rather than parse a 500.
+    /// `com.dynoxide.wasm#OpfsUnavailable` envelope a browser client can react to.
     #[error("{0}")]
     OpfsUnavailable(String),
 

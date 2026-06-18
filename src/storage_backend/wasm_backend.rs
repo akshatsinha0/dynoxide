@@ -114,9 +114,8 @@ impl WasmBridgeBackend {
     }
 
     /// Close the underlying wa-sqlite connection. The wasm engine calls this
-    /// before a re-open swaps in a new database, so the previous connection -
-    /// and the OPFS handles it would otherwise hold past its lifetime - is
-    /// released rather than leaked.
+    /// before a re-open swaps in a new database, so the old connection (and the
+    /// OPFS handles behind it) is released rather than leaked.
     pub async fn close(&self) -> Result<(), BackendError> {
         wa_close(&self.handle).await.map_err(js_err)?;
         Ok(())
@@ -175,10 +174,8 @@ fn sqlparam_to_js(p: &SqlParam<'_>) -> JsValue {
     match p {
         SqlParam::Text(s) => JsValue::from_str(s),
         // JS numbers are f64, lossless only within 2^53. The integer params here
-        // (sizes, counts, epoch seconds) stay well inside that, so they bind as
-        // numbers - wa-sqlite's common path. A value beyond the safe range would
-        // lose precision as an f64, so bind it as a BigInt (wa-sqlite stores it
-        // as int64), keeping a full 64-bit round-trip with col_i64's BigInt read.
+        // (sizes, counts, epoch seconds) stay inside that and bind as numbers; a
+        // larger value binds as a BigInt so it round-trips with col_i64's read.
         SqlParam::Integer(i) => {
             const SAFE: i64 = 1 << 53;
             if (-SAFE..=SAFE).contains(i) {
@@ -205,10 +202,8 @@ fn col_text(row: &js_sys::Array, i: u32) -> Option<String> {
 
 /// Read column `i` as an integer (0 when absent or non-numeric).
 ///
-/// Most integers come back as a JS number. A value outside f64's safe range
-/// arrives as a BigInt, which `as_f64` cannot read - decode that path explicitly
-/// rather than letting it fall through to 0 (a silent truncation the bind side
-/// guards against by storing such values as BigInt in the first place).
+/// A value outside f64's safe range comes back as a BigInt, which `as_f64`
+/// cannot read; decode it explicitly rather than truncating to 0.
 fn col_i64(row: &js_sys::Array, i: u32) -> i64 {
     let v = row.get(i);
     if let Some(f) = v.as_f64() {
@@ -285,10 +280,9 @@ fn open_err(e: JsValue) -> BackendError {
 
 /// Wrap a JS error from the bridge as a backend error.
 fn js_err(e: JsValue) -> BackendError {
-    // A thrown Error object is not a string primitive, so `as_string` returns
-    // None for it and the message would otherwise fall through to the Debug
-    // rendering (JsValue("...") noise). Read its `.message` first so the bridge's
-    // curated text (for example the OPFS busy guidance) surfaces cleanly.
+    // A thrown Error object is not a string primitive, so `as_string` is None and
+    // the message would fall through to noisy Debug output. Read its `.message`
+    // first so the bridge's curated text (e.g. the OPFS busy guidance) is clean.
     let msg = e
         .as_string()
         .or_else(|| {
