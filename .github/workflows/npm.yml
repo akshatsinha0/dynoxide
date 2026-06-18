@@ -11,6 +11,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: npm-publish-${{ inputs.tag }}
+  cancel-in-progress: false
+
 permissions:
   id-token: write
   contents: read
@@ -65,3 +69,119 @@ jobs:
           npm/scripts/publish.sh \
             --version "$PUBLISH_VERSION" \
             --release-url "https://github.com/nubo-db/dynoxide/releases/download/$PUBLISH_TAG"
+
+  # The browser engine package (@nubo-db/dynoxide-engine) is built from source
+  # here, since wasm is architecture-independent. Published via OIDC trusted
+  # publishing (no token), so its trusted publisher must be configured on
+  # npmjs.com first; the very first publish is bootstrapped manually, and the
+  # idempotent guard below then skips that already-published version.
+  publish-engine:
+    name: Publish @nubo-db/dynoxide-engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # Build from the tagged commit, not main HEAD: the dispatch runs on main,
+      # but the published wasm must match the release tag (the native publish job
+      # gets this for free by downloading the tagged release assets).
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      # wasm-pack drives the wasm-bindgen build inside scripts/build-wasm.sh.
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      # setup-node's registry-url writes an .npmrc auth line that breaks OIDC, so
+      # set the registry directly instead.
+      - name: Configure npm registry
+        run: npm config set registry https://registry.npmjs.org
+
+      - name: Determine version
+        id: version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="$INPUT_TAG"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Invalid tag format: $TAG (expected vX.Y.Z)"
+            exit 1
+          fi
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # Idempotent: skip if this version is already on npm (the manual bootstrap
+      # publish, or a re-run) rather than fail on a duplicate.
+      - name: Skip if this version is already published
+        id: published
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if npm view "@nubo-db/dynoxide-engine@$VERSION" version >/dev/null 2>&1; then
+            echo "::notice::@nubo-db/dynoxide-engine@$VERSION already published; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install npm dependencies
+        if: steps.published.outputs.skip == 'false'
+        run: npm ci
+
+      - name: Build the engine package
+        if: steps.published.outputs.skip == 'false'
+        run: npm run build:wasm
+
+      - name: Stamp the package version from the tag
+        if: steps.published.outputs.skip == 'false'
+        working-directory: npm/dynoxide-engine
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Verify the engine version matches the release
+        if: steps.published.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # build-wasm.sh stamps manifest.engineVersion from Cargo.toml, so a
+          # mismatch means Cargo.toml was not bumped to the release version.
+          MANIFEST_VERSION=$(node -p "require('./npm/dynoxide-engine/manifest.json').engineVersion")
+          if [ "$MANIFEST_VERSION" != "$VERSION" ]; then
+            echo "::error::engine manifest version ($MANIFEST_VERSION) != release version ($VERSION); is Cargo.toml bumped to $VERSION?"
+            exit 1
+          fi
+
+      - name: Choose dist-tag
+        if: steps.published.outputs.skip == 'false'
+        id: disttag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # A prerelease (e.g. 0.10.1-pre.1) goes to `next` so it never clobbers
+          # `latest`; a normal version goes to `latest`.
+          if [[ "$VERSION" == *-* ]]; then
+            echo "tag=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish (dry-run)
+        if: steps.published.outputs.skip == 'false'
+        working-directory: npm/dynoxide-engine
+        run: npm publish --dry-run --access public --provenance --tag "${{ steps.disttag.outputs.tag }}"
+
+      - name: Publish to npm
+        if: steps.published.outputs.skip == 'false'
+        working-directory: npm/dynoxide-engine
+        run: npm publish --access public --provenance --tag "${{ steps.disttag.outputs.tag }}"
