@@ -37,7 +37,7 @@ use crate::storage::{
 };
 use crate::storage_backend::sql_builders::{self, SqlParam};
 use crate::storage_backend::{
-    BackendError, BaseItemRow, Clock, GsiItemRow, StorageBackend, SystemClock,
+    BackendError, BaseItemRow, Clock, GsiItemRow, IndexWriteOp, StorageBackend, SystemClock,
 };
 use crate::types::Tag;
 
@@ -65,6 +65,12 @@ extern "C" {
         handle: &JsValue,
         sql: &str,
         param_rows: js_sys::Array,
+    ) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(catch, js_name = "exec_script")]
+    async fn bridge_exec_script(
+        handle: &JsValue,
+        statements: js_sys::Array,
     ) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(catch, js_name = "close")]
@@ -154,6 +160,20 @@ impl WasmBridgeBackend {
         Ok(())
     }
 
+    /// Run several distinct `(sql, params)` statements in order in a single
+    /// bridge crossing. Like [`exec_batch`](Self::exec_batch) it owns no
+    /// transaction: the caller's open transaction supplies atomicity, and a
+    /// mid-script failure (reported by the bridge with the failing statement
+    /// index) is rolled back by that caller. Collapses the per-index fan-out -
+    /// a delete and an insert per GSI/LSI - from one crossing per operation into
+    /// one crossing for the whole list.
+    async fn exec_script(&self, statements: js_sys::Array) -> Result<(), BackendError> {
+        bridge_exec_script(&self.handle, statements)
+            .await
+            .map_err(js_err)?;
+        Ok(())
+    }
+
     /// Run a query, returning rows as a JS array of column arrays.
     async fn query(
         &self,
@@ -201,6 +221,68 @@ fn params_rows_to_js(rows: &[Vec<SqlParam<'_>>]) -> js_sys::Array {
     let arr = js_sys::Array::new();
     for row in rows {
         arr.push(&params_to_js(row));
+    }
+    arr
+}
+
+/// Resolve one [`IndexWriteOp`] to the `(sql, params)` the wasm bridge runs for
+/// it, through the same shared [`sql_builders`] the per-item methods use. The
+/// returned `SqlParam`s borrow from `op`, so the value must outlive this pair.
+fn index_write_op_sql(op: &IndexWriteOp) -> (String, Vec<SqlParam<'_>>) {
+    match op {
+        IndexWriteOp::DeleteGsi {
+            table_name,
+            index_name,
+            table_pk,
+            table_sk,
+        } => sql_builders::delete_gsi_item(table_name, index_name, table_pk, table_sk),
+        IndexWriteOp::InsertGsi {
+            table_name,
+            index_name,
+            gsi_pk,
+            gsi_sk,
+            table_pk,
+            table_sk,
+            item_json,
+        } => (
+            sql_builders::gsi_insert_sql(table_name, index_name),
+            sql_builders::gsi_insert_params(gsi_pk, gsi_sk, table_pk, table_sk, item_json),
+        ),
+        IndexWriteOp::DeleteLsi {
+            table_name,
+            index_name,
+            base_pk,
+            base_sk,
+        } => sql_builders::delete_lsi_item(table_name, index_name, base_pk, base_sk),
+        IndexWriteOp::InsertLsi {
+            table_name,
+            index_name,
+            pk,
+            sk,
+            base_pk,
+            base_sk,
+            item_json,
+        } => (
+            sql_builders::lsi_insert_sql(table_name, index_name),
+            sql_builders::lsi_insert_params(pk, sk, base_pk, base_sk, item_json),
+        ),
+    }
+}
+
+/// Convert an index-write op list to the JS array of `{ sql, params }` objects
+/// `exec_script` runs in order. Unlike [`params_rows_to_js`] (positional arrays
+/// for one reused statement), each entry pairs its own SQL with its own params,
+/// since the fan-out is several different statements.
+fn params_scripts_to_js(ops: &[IndexWriteOp]) -> js_sys::Array {
+    let arr = js_sys::Array::new();
+    for op in ops {
+        let (sql, params) = index_write_op_sql(op);
+        let stmt = js_sys::Object::new();
+        js_sys::Reflect::set(&stmt, &JsValue::from_str("sql"), &JsValue::from_str(&sql))
+            .expect("Reflect::set on a fresh object cannot fail");
+        js_sys::Reflect::set(&stmt, &JsValue::from_str("params"), &params_to_js(&params))
+            .expect("Reflect::set on a fresh object cannot fail");
+        arr.push(&stmt);
     }
     arr
 }
@@ -641,6 +723,20 @@ impl StorageBackend for WasmBridgeBackend {
         let (sql, p) = sql_builders::scan_lsi_items(table_name, index_name, params);
         let rows = self.query(&sql, p).await?;
         Ok(rows_to_triples(&rows))
+    }
+
+    // --- Index write fan-out --------------------------------------------
+
+    /// Collapse the per-index fan-out into a single bridge crossing. The default
+    /// impl would replay each op through the per-item methods, one crossing
+    /// each; here the whole `(sql, params)` list crosses once as an ordered
+    /// `exec_script`. An empty list crosses zero times, exactly as the per-op
+    /// loop's empty iteration did, so a table with no indexes pays nothing.
+    async fn apply_index_writes(&self, ops: &[IndexWriteOp]) -> Result<(), BackendError> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.exec_script(params_scripts_to_js(ops)).await
     }
 
     // --- Transactions ----------------------------------------------------

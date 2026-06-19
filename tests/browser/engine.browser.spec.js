@@ -746,3 +746,106 @@ test("a GSI added to a populated table survives a reload (OPFS)", async ({ page 
   expect(reopened.mode).toBe("opfs");
   expect(reopened.count).toBe(1); // the backfilled index persisted across reload
 });
+
+test("an overwrite and a delete keep GSI and LSI in step with the fan-out batched over the bridge", async ({ page }) => {
+  // Each indexed write and delete maintains its GSI and LSI through one batched
+  // bridge crossing (apply_index_writes -> exec_script). This proves the batched
+  // delete-then-insert (overwrite) and the batched delete-only (delete) fan-outs
+  // are correct end to end on OPFS, not just in the Node bridge test.
+  const result = await page.evaluate(async () => {
+    const client = globalThis.dynoxide.makeClient({ name: `fanout-${crypto.randomUUID()}` });
+    await client.ready();
+    await client.execute("CreateTable", {
+      TableName: "Fanout",
+      KeySchema: [
+        { AttributeName: "pk", KeyType: "HASH" },
+        { AttributeName: "sk", KeyType: "RANGE" },
+      ],
+      AttributeDefinitions: [
+        { AttributeName: "pk", AttributeType: "S" },
+        { AttributeName: "sk", AttributeType: "S" },
+        { AttributeName: "gpk", AttributeType: "S" },
+        { AttributeName: "lsk", AttributeType: "S" },
+      ],
+      GlobalSecondaryIndexes: [
+        {
+          IndexName: "byG",
+          KeySchema: [{ AttributeName: "gpk", KeyType: "HASH" }],
+          Projection: { ProjectionType: "ALL" },
+        },
+      ],
+      LocalSecondaryIndexes: [
+        {
+          IndexName: "byL",
+          KeySchema: [
+            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: "lsk", KeyType: "RANGE" },
+          ],
+          Projection: { ProjectionType: "ALL" },
+        },
+      ],
+      BillingMode: "PAY_PER_REQUEST",
+    });
+
+    const put = (gpk, lsk) =>
+      client.execute("PutItem", {
+        TableName: "Fanout",
+        Item: { pk: { S: "p1" }, sk: { S: "s1" }, gpk: { S: gpk }, lsk: { S: lsk } },
+      });
+    const queryGsi = (gpk) =>
+      client.execute("Query", {
+        TableName: "Fanout",
+        IndexName: "byG",
+        KeyConditionExpression: "gpk = :g",
+        ExpressionAttributeValues: { ":g": { S: gpk } },
+      });
+    const queryLsi = () =>
+      client.execute("Query", {
+        TableName: "Fanout",
+        IndexName: "byL",
+        KeyConditionExpression: "pk = :p",
+        ExpressionAttributeValues: { ":p": { S: "p1" } },
+      });
+
+    await put("g1", "l1");
+    const g1Initial = (await queryGsi("g1")).Count;
+    const lsiInitial = (await queryLsi()).Items.map((i) => i.lsk.S);
+
+    // Overwrite with changed index keys: the batched delete-then-insert must
+    // drop the stale index entries and write the new ones in one crossing.
+    await put("g2", "l2");
+    const g1AfterOverwrite = (await queryGsi("g1")).Count;
+    const g2AfterOverwrite = (await queryGsi("g2")).Count;
+    const lsiAfterOverwrite = (await queryLsi()).Items.map((i) => i.lsk.S);
+
+    // Delete: the batched delete-only fan-out must clear both indexes.
+    await client.execute("DeleteItem", {
+      TableName: "Fanout",
+      Key: { pk: { S: "p1" }, sk: { S: "s1" } },
+    });
+    const g2AfterDelete = (await queryGsi("g2")).Count;
+    const lsiAfterDelete = (await queryLsi()).Count;
+
+    const out = {
+      mode: client.persistenceMode,
+      g1Initial,
+      lsiInitial,
+      g1AfterOverwrite,
+      g2AfterOverwrite,
+      lsiAfterOverwrite,
+      g2AfterDelete,
+      lsiAfterDelete,
+    };
+    client.terminate();
+    return out;
+  });
+
+  expect(result.mode).toBe("opfs");
+  expect(result.g1Initial).toBe(1); // the put landed in the GSI
+  expect(result.lsiInitial).toEqual(["l1"]); // and in the LSI
+  expect(result.g1AfterOverwrite).toBe(0); // stale GSI entry deleted in the batch
+  expect(result.g2AfterOverwrite).toBe(1); // new GSI entry inserted in the same batch
+  expect(result.lsiAfterOverwrite).toEqual(["l2"]); // LSI re-pointed, no stale row left
+  expect(result.g2AfterDelete).toBe(0); // delete-path fan-out cleared the GSI
+  expect(result.lsiAfterDelete).toBe(0); // and the LSI
+});

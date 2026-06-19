@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- On the wasm backend, the per-write and per-delete secondary-index fan-out now crosses the JS bridge once per index type rather than once per index operation. Keeping a table's GSIs and LSIs in step with a write is a delete and a re-insert per index, each previously its own bridge crossing; a new `exec_script` primitive carries the whole ordered batch over in a single crossing, so an indexed `PutItem` or `DeleteItem` on a table with K GSIs and L LSIs drops from order K+L crossings to a constant two. Index contents and native behaviour are unchanged ([#85](https://github.com/nubo-db/dynoxide/issues/85)).
 - The browser backend moved from `wa-sqlite` to the official [`@sqlite.org/sqlite-wasm`](https://github.com/sqlite/sqlite-wasm) engine, maintained by the SQLite team and versioned to track SQLite releases. The bridge now runs through the `sqlite3.oo1` API over the OPFS SAHPool VFS, which keeps the no-COOP/COEP guarantee that motivated the original VFS choice (it needs no `SharedArrayBuffer`). The `open`/`exec`/`query`/`close` contract is unchanged, so consumers of `@nubo-db/dynoxide-engine` need no code change. A busy database now recovers once the holder releases it rather than staying busy until reload, and the full 64-bit integer round-trip and the `fnv1a_hash` scalar are re-proven on the new engine ([#61](https://github.com/nubo-db/dynoxide/issues/61)). The shipped SQLite `.wasm` is larger than before (~845 KB against wa-sqlite's ~545 KB).
 
 ### Fixed

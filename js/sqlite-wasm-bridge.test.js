@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { open, exec, query, close, exec_batch } from "./sqlite-wasm-bridge.js";
+import { open, exec, query, close, exec_batch, exec_script } from "./sqlite-wasm-bridge.js";
 import { fnv1aHash } from "./fnv1a.js";
 
 // Off-browser proof of the bridge's SQL contract against the official
@@ -23,10 +23,10 @@ async function withMemoryDb(fn) {
   }
 }
 
-test("the bridge exports exactly the open/exec/query/close contract", () => {
-  // The Rust extern block binds these four names by js_name; the migration must
-  // not rename or drop any of them.
-  for (const fn of [open, exec, query, close]) {
+test("the bridge exports the open/exec/query/close/exec_batch/exec_script contract", () => {
+  // The Rust extern block binds these names by js_name; none may be renamed or
+  // dropped without updating the matching wasm-bindgen extern.
+  for (const fn of [open, exec, query, close, exec_batch, exec_script]) {
     assert.equal(typeof fn, "function");
   }
 });
@@ -237,5 +237,94 @@ test("a mid-batch failure names the row and the caller's rollback undoes the bat
     await exec(handle, "ROLLBACK", []);
     const [[count]] = await query(handle, "SELECT count(*) FROM t", []);
     assert.equal(Number(count), 0); // row 0 was rolled back with the outer transaction
+  });
+});
+
+// --- exec_script: the ordered-multi-statement primitive (issue #85) ---------
+
+// The per-write/per-delete index fan-out is a delete then an insert per index:
+// several different statements, one binding each, run in order. exec_script
+// carries that list across the bridge in a single crossing.
+const GSI_DELETE = "DELETE FROM g WHERE table_pk = ?1 AND table_sk = ?2";
+
+test("exec_script applies an ordered delete-then-insert in one call", async () => {
+  // The overwrite shape: an existing index entry for a base key is deleted, then
+  // the new projection is inserted. Ordering is load-bearing - the delete must
+  // land before the re-insert - so a stale row left behind would fail this.
+  await withMemoryDb(async (handle) => {
+    await exec(handle, GSI_DDL, []);
+    await exec(handle, GSI_INSERT, ["old", "s", "p1", "t1", '{"v":"old"}']);
+    await exec_script(handle, [
+      { sql: GSI_DELETE, params: ["p1", "t1"] },
+      { sql: GSI_INSERT, params: ["new", "s", "p1", "t1", '{"v":"new"}'] },
+    ]);
+    const rows = await query(handle, "SELECT gsi_pk, item_json FROM g", []);
+    assert.deepEqual(rows, [["new", '{"v":"new"}']]);
+  });
+});
+
+test("exec_script runs several distinct statements against different tables", async () => {
+  // GSI and LSI fan-outs target different index tables in the same call; prove
+  // the primitive is not tied to one statement shape the way exec_batch is.
+  await withMemoryDb(async (handle) => {
+    await exec(handle, GSI_DDL, []);
+    await exec(handle, "CREATE TABLE l (pk TEXT, sk TEXT, base_pk TEXT, base_sk TEXT, item_json TEXT)", []);
+    await exec_script(handle, [
+      { sql: GSI_INSERT, params: ["g", "s", "p", "t", "{}"] },
+      { sql: "INSERT INTO l (pk, sk, base_pk, base_sk, item_json) VALUES (?1, ?2, ?3, ?4, ?5)", params: ["p", "ls", "p", "t", "{}"] },
+    ]);
+    const [[g]] = await query(handle, "SELECT count(*) FROM g", []);
+    const [[l]] = await query(handle, "SELECT count(*) FROM l", []);
+    assert.equal(Number(g), 1);
+    assert.equal(Number(l), 1);
+  });
+});
+
+test("exec_script is a no-op on an empty list", async () => {
+  await withMemoryDb(async (handle) => {
+    await exec(handle, GSI_DDL, []);
+    await exec_script(handle, []);
+    const [[count]] = await query(handle, "SELECT count(*) FROM g", []);
+    assert.equal(Number(count), 0);
+  });
+});
+
+test("exec_script runs inside the caller's open transaction", async () => {
+  // The real usage shape: the fan-out runs between the BEGIN and COMMIT that the
+  // write owns. The primitive itself issues no BEGIN/COMMIT.
+  await withMemoryDb(async (handle) => {
+    await exec(handle, GSI_DDL, []);
+    await exec(handle, "BEGIN IMMEDIATE", []);
+    await exec_script(handle, [
+      { sql: GSI_INSERT, params: ["g0", "s0", "p0", "t0", "{}"] },
+      { sql: GSI_INSERT, params: ["g1", "s1", "p1", "t1", "{}"] },
+    ]);
+    await exec(handle, "COMMIT", []);
+    const [[count]] = await query(handle, "SELECT count(*) FROM g", []);
+    assert.equal(Number(count), 2);
+  });
+});
+
+test("a mid-script failure names the statement and the caller's rollback undoes it", async () => {
+  // Atomicity comes from the caller's transaction, not the primitive: a statement
+  // that violates a constraint mid-script throws with its index, and ROLLBACK
+  // undoes even the statements that applied before it.
+  await withMemoryDb(async (handle) => {
+    await exec(handle, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)", []);
+    await exec(handle, "BEGIN IMMEDIATE", []);
+    await assert.rejects(
+      () =>
+        exec_script(handle, [
+          { sql: "INSERT INTO t (id, v) VALUES (?1, ?2)", params: [1, "ok"] },
+          { sql: "INSERT INTO t (id, v) VALUES (?1, ?2)", params: [2, null] }, // NOT NULL violation
+        ]),
+      (e) => {
+        assert.match(e.message, /statement 1/);
+        return true;
+      },
+    );
+    await exec(handle, "ROLLBACK", []);
+    const [[count]] = await query(handle, "SELECT count(*) FROM t", []);
+    assert.equal(Number(count), 0); // statement 0 was rolled back with the outer transaction
   });
 });
