@@ -6,9 +6,11 @@ Both backends issue the same SQL. The native and wasm code share one set of quer
 
 It's a preview. The wasm build is **not** run against the conformance suite that backs the native build, so its correctness rests on its own tests for now. A build made with `--features wasm-sqlite` exposes `dynoxide::WASM_PREVIEW` (`true`) so you can tell which path you're on.
 
-**What works:** create and delete tables, describe and list them, put, get, delete, and update items, query, scan, and the batch and transactional reads (`BatchGetItem`, `BatchWriteItem`, `TransactGetItems`), over base tables and both secondary index types (GSI and LSI). Index maintenance is atomic with the base write, same as native.
+**What works:** create and delete tables, describe and list them, update tables (add or delete a GSI, with existing rows backfilled into the new index, and change provisioned throughput, billing mode, table class, on-demand throughput, and deletion protection), put, get, delete, and update items, query, scan, and the batch and transactional reads (`BatchGetItem`, `BatchWriteItem`, `TransactGetItems`), over base tables and both secondary index types (GSI and LSI). Index maintenance is atomic with the base write, same as native.
 
-**What doesn't, yet:** TTL returns a typed `Unsupported` error (it needs a background sweep the browser doesn't drive). Streams are planned but not wired - the delivery mechanism is still to be decided. `TransactWriteItems`, tags, table-setting updates, table stats, and bulk import return a preview "not yet implemented" error.
+**What doesn't, yet:** TTL returns a typed `Unsupported` error (it needs a background sweep the browser doesn't drive). Streams are planned but not wired - the delivery mechanism is still to be decided, so an `UpdateTable` that changes a stream specification is refused. `TransactWriteItems`, tags, table stats, and bulk import return a preview "not yet implemented" error.
+
+One fidelity note on what *is* supported: adding a GSI is synchronous. The new index is immediately `ACTIVE` and queryable, where AWS reports it `CREATING` with a background backfill that finishes before it becomes `ACTIVE`. The backfilled data matches; only the lifecycle is simplified.
 
 The engine runs in a Web Worker (OPFS's synchronous file handles are Worker-only), and the page talks to it over a message channel. It needs no special server headers (no COOP/COEP cross-origin isolation), so it works on ordinary static hosting.
 

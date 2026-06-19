@@ -526,7 +526,16 @@ test("UpdateTable adds a GSI to a populated table and backfills the existing row
       KeyConditionExpression: "genre = :g",
       ExpressionAttributeValues: { ":g": { S: "rock" } },
     });
-    const out = { mode: client.persistenceMode, count: q.Count, songs: q.Items.map((i) => i.song.S).sort() };
+    // The new index reports its status: dynoxide creates a GSI synchronously, so
+    // it is immediately ACTIVE rather than transitioning through CREATING.
+    const desc = await client.execute("DescribeTable", { TableName: table.TableName });
+    const gsi = (desc.Table.GlobalSecondaryIndexes || []).find((g) => g.IndexName === "GenreIndex");
+    const out = {
+      mode: client.persistenceMode,
+      count: q.Count,
+      songs: q.Items.map((i) => i.song.S).sort(),
+      indexStatus: gsi && gsi.IndexStatus,
+    };
     client.terminate();
     return out;
   }, MUSIC);
@@ -534,6 +543,9 @@ test("UpdateTable adds a GSI to a populated table and backfills the existing row
   expect(result.mode).toBe("opfs");
   expect(result.count).toBe(2); // s1 and s3 were backfilled into the new index
   expect(result.songs).toEqual(["s1", "s3"]);
+  // A freshly added GSI is synchronously ACTIVE, a deliberate preview divergence
+  // from AWS, where the index is CREATING with a background backfill first.
+  expect(result.indexStatus).toBe("ACTIVE");
 });
 
 test("UpdateTable deletes a GSI; the index stops answering and the base table survives", async ({ page }) => {
