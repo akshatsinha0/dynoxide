@@ -14,6 +14,8 @@ One fidelity note on what *is* supported: adding a GSI is synchronous. The new i
 
 The engine runs in a Web Worker (OPFS's synchronous file handles are Worker-only), and the page talks to it over a message channel. It needs no special server headers (no COOP/COEP cross-origin isolation), so it works on ordinary static hosting.
 
+Keeping secondary indexes in step with a write means a delete and a re-insert per GSI and per LSI, and on wasm each of those statements is a bridge crossing. The maintenance for one write (or one delete) is issued as a single ordered batch through the `exec_script` bridge primitive - one crossing for the whole GSI fan-out and one for the LSI fan-out - rather than one crossing per index operation. A table with no indexes crosses zero extra times. Native runs the same fan-out in-process, so it has no crossings to save.
+
 ## Persistence and durability
 
 The database lives in OPFS, reached through the official OPFS SAHPool VFS - a pool of synchronous access handles. Where a browser can't provide those handles - a Firefox private window, an older Safari - the engine falls back to an in-memory database that works for the session but doesn't survive a reload, and `open` reports which mode you got as `persistenceMode` so you can warn the user.
