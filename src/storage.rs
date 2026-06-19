@@ -674,10 +674,10 @@ impl Storage {
         attribute_definitions: &str,
         gsi_definitions: Option<&str>,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE _tables SET attribute_definitions = ?1, gsi_definitions = ?2 WHERE table_name = ?3",
-            params![attribute_definitions, gsi_definitions, table_name],
-        )?;
+        let (sql, params) =
+            sql_builders::update_table_metadata(table_name, attribute_definitions, gsi_definitions);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         self.metadata_cache.borrow_mut().remove(table_name);
         Ok(())
     }
@@ -688,40 +688,37 @@ impl Storage {
         table_name: &str,
         provisioned_throughput: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE _tables SET provisioned_throughput = ?1 WHERE table_name = ?2",
-            params![provisioned_throughput, table_name],
-        )?;
+        let (sql, params) =
+            sql_builders::update_provisioned_throughput(table_name, provisioned_throughput);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         self.metadata_cache.borrow_mut().remove(table_name);
         Ok(())
     }
 
     /// Clear provisioned throughput for a table (sets to SQL NULL).
     pub fn clear_provisioned_throughput(&self, table_name: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE _tables SET provisioned_throughput = NULL WHERE table_name = ?1",
-            params![table_name],
-        )?;
+        let (sql, params) = sql_builders::clear_provisioned_throughput(table_name);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         self.metadata_cache.borrow_mut().remove(table_name);
         Ok(())
     }
 
     /// Update billing mode for a table.
     pub fn update_billing_mode(&self, table_name: &str, billing_mode: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE _tables SET billing_mode = ?1 WHERE table_name = ?2",
-            params![billing_mode, table_name],
-        )?;
+        let (sql, params) = sql_builders::update_billing_mode(table_name, billing_mode);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         self.metadata_cache.borrow_mut().remove(table_name);
         Ok(())
     }
 
     /// Update the table class for a table.
     pub fn update_table_class(&self, table_name: &str, table_class: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE _tables SET table_class = ?1 WHERE table_name = ?2",
-            params![table_class, table_name],
-        )?;
+        let (sql, params) = sql_builders::update_table_class(table_name, table_class);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         self.metadata_cache.borrow_mut().remove(table_name);
         Ok(())
     }
@@ -732,10 +729,10 @@ impl Storage {
         table_name: &str,
         on_demand_throughput: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE _tables SET on_demand_throughput = ?1 WHERE table_name = ?2",
-            params![on_demand_throughput, table_name],
-        )?;
+        let (sql, params) =
+            sql_builders::update_on_demand_throughput(table_name, on_demand_throughput);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         self.metadata_cache.borrow_mut().remove(table_name);
         Ok(())
     }
@@ -796,10 +793,9 @@ impl Storage {
 
     /// Update the deletion protection setting for a table.
     pub fn update_deletion_protection(&self, table_name: &str, enabled: bool) -> Result<()> {
-        self.conn.execute(
-            "UPDATE _tables SET deletion_protection_enabled = ?1 WHERE table_name = ?2",
-            params![enabled as i32, table_name],
-        )?;
+        let (sql, params) = sql_builders::update_deletion_protection(table_name, enabled);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         self.metadata_cache.borrow_mut().remove(table_name);
         Ok(())
     }

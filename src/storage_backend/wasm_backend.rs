@@ -1,12 +1,13 @@
-//! Working wa-sqlite [`StorageBackend`] over a wasm-bindgen bridge.
+//! Working [`StorageBackend`] over a wasm-bindgen bridge to the official
+//! @sqlite.org/sqlite-wasm engine.
 //!
 //! `WasmBridgeBackend` runs the same SQL the native backend issues - both
 //! consume the shared builders in [`sql_builders`] - but executes it against a
-//! JS wa-sqlite database through the bridge in `js/wa-sqlite-bridge.js`. The
-//! bridge runs inside a Web Worker and persists to OPFS via wa-sqlite's
-//! synchronous access-handle VFS, which browsers expose only in a Worker. The
-//! page drives the engine over a message RPC; no cross-origin isolation
-//! (COOP/COEP) is required.
+//! JS SQLite database through the bridge in `js/sqlite-wasm-bridge.js`. The
+//! bridge runs inside a Web Worker and persists to OPFS via the official OPFS
+//! SAHPool VFS, which browsers expose only in a Worker. The page drives the
+//! engine over a message RPC; no cross-origin isolation (COOP/COEP) is
+//! required.
 //!
 //! # Async, never blocking
 //!
@@ -40,30 +41,37 @@ use crate::storage_backend::{
 };
 use crate::types::Tag;
 
-#[wasm_bindgen(module = "/js/wa-sqlite-bridge.js")]
+#[wasm_bindgen(module = "/js/sqlite-wasm-bridge.js")]
 extern "C" {
     #[wasm_bindgen(catch, js_name = "open")]
-    async fn wa_open(name: &str, ephemeral: bool) -> Result<JsValue, JsValue>;
+    async fn bridge_open(name: &str, ephemeral: bool) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(catch, js_name = "exec")]
-    async fn wa_exec(
+    async fn bridge_exec(
         handle: &JsValue,
         sql: &str,
         params: js_sys::Array,
     ) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(catch, js_name = "query")]
-    async fn wa_query(
+    async fn bridge_query(
         handle: &JsValue,
         sql: &str,
         params: js_sys::Array,
     ) -> Result<JsValue, JsValue>;
 
+    #[wasm_bindgen(catch, js_name = "exec_batch")]
+    async fn bridge_exec_batch(
+        handle: &JsValue,
+        sql: &str,
+        param_rows: js_sys::Array,
+    ) -> Result<JsValue, JsValue>;
+
     #[wasm_bindgen(catch, js_name = "close")]
-    async fn wa_close(handle: &JsValue) -> Result<JsValue, JsValue>;
+    async fn bridge_close(handle: &JsValue) -> Result<JsValue, JsValue>;
 }
 
-/// wa-sqlite-backed storage backend driven through the JS bridge.
+/// SQLite-backed storage backend driven through the JS bridge.
 pub struct WasmBridgeBackend {
     /// Opaque JS handle returned by the bridge `open`.
     handle: JsValue,
@@ -76,7 +84,7 @@ pub struct WasmBridgeBackend {
 }
 
 impl WasmBridgeBackend {
-    /// Open (or create) a wa-sqlite database persisted under `name` (OPFS),
+    /// Open (or create) a SQLite database persisted under `name` (OPFS),
     /// bootstrapping the shared metadata schema on first use. Degrades to an
     /// ephemeral in-memory session where OPFS sync access handles are
     /// unavailable.
@@ -88,7 +96,7 @@ impl WasmBridgeBackend {
     /// when `ephemeral` is true regardless of OPFS availability. The persistent
     /// path still degrades to memory on its own when OPFS is unusable.
     pub async fn open_with(name: &str, ephemeral: bool) -> Result<Self, BackendError> {
-        let handle = wa_open(name, ephemeral).await.map_err(open_err)?;
+        let handle = bridge_open(name, ephemeral).await.map_err(open_err)?;
         // The bridge reports which VFS it actually opened against; read it off
         // the handle before treating the handle as opaque.
         let persistence_mode = js_sys::Reflect::get(&handle, &JsValue::from_str("persistenceMode"))
@@ -98,7 +106,7 @@ impl WasmBridgeBackend {
         // Bootstrap the same metadata/config/stream schema the native backend
         // creates in `initialize`. `INIT_SCHEMA` is a multi-statement batch;
         // the bridge runs each statement in turn.
-        wa_exec(&handle, sql_builders::INIT_SCHEMA, js_sys::Array::new())
+        bridge_exec(&handle, sql_builders::INIT_SCHEMA, js_sys::Array::new())
             .await
             .map_err(js_err)?;
         Ok(Self {
@@ -113,17 +121,34 @@ impl WasmBridgeBackend {
         &self.persistence_mode
     }
 
-    /// Close the underlying wa-sqlite connection. The wasm engine calls this
+    /// Close the underlying SQLite connection. The wasm engine calls this
     /// before a re-open swaps in a new database, so the old connection (and the
     /// OPFS handles behind it) is released rather than leaked.
     pub async fn close(&self) -> Result<(), BackendError> {
-        wa_close(&self.handle).await.map_err(js_err)?;
+        bridge_close(&self.handle).await.map_err(js_err)?;
         Ok(())
     }
 
     /// Run a statement that returns no rows.
     async fn exec(&self, sql: &str, params: Vec<SqlParam<'_>>) -> Result<(), BackendError> {
-        wa_exec(&self.handle, sql, params_to_js(&params))
+        bridge_exec(&self.handle, sql, params_to_js(&params))
+            .await
+            .map_err(js_err)?;
+        Ok(())
+    }
+
+    /// Run one statement once per parameter row in a single bridge crossing,
+    /// reusing one prepared statement on the JS side. Owns no transaction: the
+    /// caller's open transaction supplies atomicity, and a mid-batch failure
+    /// (reported by the bridge with the failing row index) is rolled back by
+    /// that caller. Collapses what the per-row loop paid as N wasm/JS/Worker
+    /// crossings into one.
+    async fn exec_batch(
+        &self,
+        sql: &str,
+        rows: Vec<Vec<SqlParam<'_>>>,
+    ) -> Result<(), BackendError> {
+        bridge_exec_batch(&self.handle, sql, params_rows_to_js(&rows))
             .await
             .map_err(js_err)?;
         Ok(())
@@ -135,7 +160,7 @@ impl WasmBridgeBackend {
         sql: &str,
         params: Vec<SqlParam<'_>>,
     ) -> Result<js_sys::Array, BackendError> {
-        let rows = wa_query(&self.handle, sql, params_to_js(&params))
+        let rows = bridge_query(&self.handle, sql, params_to_js(&params))
             .await
             .map_err(js_err)?;
         Ok(rows.unchecked_into())
@@ -166,6 +191,16 @@ fn params_to_js(params: &[SqlParam<'_>]) -> js_sys::Array {
     let arr = js_sys::Array::new();
     for p in params {
         arr.push(&sqlparam_to_js(p));
+    }
+    arr
+}
+
+/// Convert a batch of parameter rows to a JS array of positional arrays - the
+/// array-of-arrays shape `exec_batch` binds one row at a time.
+fn params_rows_to_js(rows: &[Vec<SqlParam<'_>>]) -> js_sys::Array {
+    let arr = js_sys::Array::new();
+    for row in rows {
+        arr.push(&params_to_js(row));
     }
     arr
 }
@@ -291,7 +326,7 @@ fn js_err(e: JsValue) -> BackendError {
                 .and_then(|v| v.as_string())
         })
         .unwrap_or_else(|| format!("{e:?}"));
-    BackendError::Other(format!("wa-sqlite: {msg}"))
+    BackendError::Other(format!("sqlite-wasm: {msg}"))
 }
 
 /// A capability this preview backend does not provide. Some are simply not
@@ -338,47 +373,56 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn update_table_metadata(
         &self,
-        _table_name: &str,
-        _attribute_definitions: &str,
-        _gsi_definitions: Option<&str>,
+        table_name: &str,
+        attribute_definitions: &str,
+        gsi_definitions: Option<&str>,
     ) -> Result<(), BackendError> {
-        Err(unsupported("update_table_metadata"))
+        let (sql, params) =
+            sql_builders::update_table_metadata(table_name, attribute_definitions, gsi_definitions);
+        self.exec(&sql, params).await
     }
 
     async fn update_provisioned_throughput(
         &self,
-        _table_name: &str,
-        _provisioned_throughput: &str,
+        table_name: &str,
+        provisioned_throughput: &str,
     ) -> Result<(), BackendError> {
-        Err(unsupported("update_provisioned_throughput"))
+        let (sql, params) =
+            sql_builders::update_provisioned_throughput(table_name, provisioned_throughput);
+        self.exec(&sql, params).await
     }
 
-    async fn clear_provisioned_throughput(&self, _table_name: &str) -> Result<(), BackendError> {
-        Err(unsupported("clear_provisioned_throughput"))
+    async fn clear_provisioned_throughput(&self, table_name: &str) -> Result<(), BackendError> {
+        let (sql, params) = sql_builders::clear_provisioned_throughput(table_name);
+        self.exec(&sql, params).await
     }
 
     async fn update_billing_mode(
         &self,
-        _table_name: &str,
-        _billing_mode: &str,
+        table_name: &str,
+        billing_mode: &str,
     ) -> Result<(), BackendError> {
-        Err(unsupported("update_billing_mode"))
+        let (sql, params) = sql_builders::update_billing_mode(table_name, billing_mode);
+        self.exec(&sql, params).await
     }
 
     async fn update_table_class(
         &self,
-        _table_name: &str,
-        _table_class: &str,
+        table_name: &str,
+        table_class: &str,
     ) -> Result<(), BackendError> {
-        Err(unsupported("update_table_class"))
+        let (sql, params) = sql_builders::update_table_class(table_name, table_class);
+        self.exec(&sql, params).await
     }
 
     async fn update_on_demand_throughput(
         &self,
-        _table_name: &str,
-        _on_demand_throughput: &str,
+        table_name: &str,
+        on_demand_throughput: &str,
     ) -> Result<(), BackendError> {
-        Err(unsupported("update_on_demand_throughput"))
+        let (sql, params) =
+            sql_builders::update_on_demand_throughput(table_name, on_demand_throughput);
+        self.exec(&sql, params).await
     }
 
     async fn get_tags(&self, _table_name: &str) -> Result<Vec<Tag>, BackendError> {
@@ -391,10 +435,11 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn update_deletion_protection(
         &self,
-        _table_name: &str,
-        _enabled: bool,
+        table_name: &str,
+        enabled: bool,
     ) -> Result<(), BackendError> {
-        Err(unsupported("update_deletion_protection"))
+        let (sql, params) = sql_builders::update_deletion_protection(table_name, enabled);
+        self.exec(&sql, params).await
     }
 
     async fn remove_tags(&self, _table_name: &str, _keys: &[String]) -> Result<(), BackendError> {
@@ -487,18 +532,29 @@ impl StorageBackend for WasmBridgeBackend {
         index_name: &str,
         rows: &[GsiItemRow],
     ) -> Result<(), BackendError> {
-        let sql = sql_builders::gsi_insert_sql(table_name, index_name);
-        for row in rows {
-            let params = sql_builders::gsi_insert_params(
-                &row.gsi_pk,
-                &row.gsi_sk,
-                &row.table_pk,
-                &row.table_sk,
-                &row.item_json,
-            );
-            self.exec(&sql, params).await?;
+        // Empty backfill window: cross zero times, exactly as the per-row loop
+        // did, so a sparse window with no keyed rows stays a strict improvement.
+        if rows.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        // Build the SQL once and assemble every row's parameters, then make a
+        // single bridge crossing instead of one per row. Atomicity is unchanged:
+        // the caller's open transaction (UpdateTable's backfill runs inside one)
+        // still commits or rolls back the whole batch.
+        let sql = sql_builders::gsi_insert_sql(table_name, index_name);
+        let param_rows = rows
+            .iter()
+            .map(|row| {
+                sql_builders::gsi_insert_params(
+                    &row.gsi_pk,
+                    &row.gsi_sk,
+                    &row.table_pk,
+                    &row.table_sk,
+                    &row.item_json,
+                )
+            })
+            .collect();
+        self.exec_batch(&sql, param_rows).await
     }
 
     async fn delete_gsi_item(
@@ -601,7 +657,7 @@ impl StorageBackend for WasmBridgeBackend {
         self.exec(sql_builders::ROLLBACK, Vec::new()).await
     }
 
-    // Bulk-loading PRAGMAs do not apply to the wa-sqlite OPFS VFS; treat the
+    // Bulk-loading PRAGMAs do not apply to the OPFS SAHPool VFS; treat the
     // toggles as no-ops so callers that bracket writes still work.
     async fn enable_bulk_loading(&self) -> Result<(), BackendError> {
         Ok(())
