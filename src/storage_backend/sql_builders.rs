@@ -222,6 +222,98 @@ pub fn table_exists(table_name: &str) -> (String, Vec<SqlParam<'_>>) {
     )
 }
 
+// --- Table-setting updates (`_tables`) ----------------------------------
+//
+// The `UpdateTable` mutations: each is a single `UPDATE _tables SET <col> = ?`.
+// Shared so both backends issue identical SQL; the strings here are the single
+// source of truth and are pinned byte-for-byte (with their params) by the tests
+// below, so a native re-point or a wasm port cannot drift them apart.
+
+/// Update a table's attribute and GSI definitions. The write the add/delete-GSI
+/// path of `UpdateTable` issues; `gsi_definitions` is `None` (SQL `NULL`) when no
+/// GSIs remain.
+pub fn update_table_metadata<'a>(
+    table_name: &'a str,
+    attribute_definitions: &'a str,
+    gsi_definitions: Option<&'a str>,
+) -> (String, Vec<SqlParam<'a>>) {
+    (
+        "UPDATE _tables SET attribute_definitions = ?1, gsi_definitions = ?2 WHERE table_name = ?3"
+            .to_string(),
+        vec![
+            SqlParam::text(attribute_definitions),
+            SqlParam::opt_text(gsi_definitions),
+            SqlParam::text(table_name),
+        ],
+    )
+}
+
+/// Set a table's provisioned-throughput JSON.
+pub fn update_provisioned_throughput<'a>(
+    table_name: &'a str,
+    provisioned_throughput: &'a str,
+) -> (String, Vec<SqlParam<'a>>) {
+    (
+        "UPDATE _tables SET provisioned_throughput = ?1 WHERE table_name = ?2".to_string(),
+        vec![
+            SqlParam::text(provisioned_throughput),
+            SqlParam::text(table_name),
+        ],
+    )
+}
+
+/// Clear a table's provisioned throughput (switching to on-demand billing).
+pub fn clear_provisioned_throughput(table_name: &str) -> (String, Vec<SqlParam<'_>>) {
+    (
+        "UPDATE _tables SET provisioned_throughput = NULL WHERE table_name = ?1".to_string(),
+        vec![SqlParam::text(table_name)],
+    )
+}
+
+/// Set a table's billing mode.
+pub fn update_billing_mode<'a>(
+    table_name: &'a str,
+    billing_mode: &'a str,
+) -> (String, Vec<SqlParam<'a>>) {
+    (
+        "UPDATE _tables SET billing_mode = ?1 WHERE table_name = ?2".to_string(),
+        vec![SqlParam::text(billing_mode), SqlParam::text(table_name)],
+    )
+}
+
+/// Set a table's storage class.
+pub fn update_table_class<'a>(
+    table_name: &'a str,
+    table_class: &'a str,
+) -> (String, Vec<SqlParam<'a>>) {
+    (
+        "UPDATE _tables SET table_class = ?1 WHERE table_name = ?2".to_string(),
+        vec![SqlParam::text(table_class), SqlParam::text(table_name)],
+    )
+}
+
+/// Set a table's on-demand-throughput JSON.
+pub fn update_on_demand_throughput<'a>(
+    table_name: &'a str,
+    on_demand_throughput: &'a str,
+) -> (String, Vec<SqlParam<'a>>) {
+    (
+        "UPDATE _tables SET on_demand_throughput = ?1 WHERE table_name = ?2".to_string(),
+        vec![
+            SqlParam::text(on_demand_throughput),
+            SqlParam::text(table_name),
+        ],
+    )
+}
+
+/// Set a table's deletion-protection flag (stored as INTEGER 0/1).
+pub fn update_deletion_protection(table_name: &str, enabled: bool) -> (String, Vec<SqlParam<'_>>) {
+    (
+        "UPDATE _tables SET deletion_protection_enabled = ?1 WHERE table_name = ?2".to_string(),
+        vec![SqlParam::Integer(enabled as i64), SqlParam::text(table_name)],
+    )
+}
+
 // --- Data tables ---------------------------------------------------------
 
 /// Create the per-table data table.
@@ -1157,6 +1249,79 @@ mod tests {
                 SqlParam::Integer(3),
                 SqlParam::Integer(1),
             ]
+        );
+    }
+
+    // The conformance gate's fast half. Pin each table-setting update builder's
+    // (SQL, params) pair byte-for-byte to exactly what the native backend issued
+    // before these builders existed. Pinning the params alongside the string,
+    // not the string alone, catches a reorder or reshape of the bound params
+    // that a string-only check would miss, so the fast gate stands on its own
+    // and does not lean on the slower conformance run to find drift.
+    #[test]
+    fn table_setting_update_builders_are_pinned() {
+        assert_eq!(
+            update_table_metadata("T", "{attrs}", Some("{gsis}")),
+            (
+                "UPDATE _tables SET attribute_definitions = ?1, gsi_definitions = ?2 WHERE table_name = ?3".to_string(),
+                vec![SqlParam::text("{attrs}"), SqlParam::text("{gsis}"), SqlParam::text("T")],
+            )
+        );
+        assert_eq!(
+            update_table_metadata("T", "{attrs}", None),
+            (
+                "UPDATE _tables SET attribute_definitions = ?1, gsi_definitions = ?2 WHERE table_name = ?3".to_string(),
+                vec![SqlParam::text("{attrs}"), SqlParam::Null, SqlParam::text("T")],
+            )
+        );
+        assert_eq!(
+            update_provisioned_throughput("T", "{pt}"),
+            (
+                "UPDATE _tables SET provisioned_throughput = ?1 WHERE table_name = ?2".to_string(),
+                vec![SqlParam::text("{pt}"), SqlParam::text("T")],
+            )
+        );
+        assert_eq!(
+            clear_provisioned_throughput("T"),
+            (
+                "UPDATE _tables SET provisioned_throughput = NULL WHERE table_name = ?1".to_string(),
+                vec![SqlParam::text("T")],
+            )
+        );
+        assert_eq!(
+            update_billing_mode("T", "PAY_PER_REQUEST"),
+            (
+                "UPDATE _tables SET billing_mode = ?1 WHERE table_name = ?2".to_string(),
+                vec![SqlParam::text("PAY_PER_REQUEST"), SqlParam::text("T")],
+            )
+        );
+        assert_eq!(
+            update_table_class("T", "STANDARD_INFREQUENT_ACCESS"),
+            (
+                "UPDATE _tables SET table_class = ?1 WHERE table_name = ?2".to_string(),
+                vec![SqlParam::text("STANDARD_INFREQUENT_ACCESS"), SqlParam::text("T")],
+            )
+        );
+        assert_eq!(
+            update_on_demand_throughput("T", "{odt}"),
+            (
+                "UPDATE _tables SET on_demand_throughput = ?1 WHERE table_name = ?2".to_string(),
+                vec![SqlParam::text("{odt}"), SqlParam::text("T")],
+            )
+        );
+        assert_eq!(
+            update_deletion_protection("T", true),
+            (
+                "UPDATE _tables SET deletion_protection_enabled = ?1 WHERE table_name = ?2".to_string(),
+                vec![SqlParam::Integer(1), SqlParam::text("T")],
+            )
+        );
+        assert_eq!(
+            update_deletion_protection("T", false),
+            (
+                "UPDATE _tables SET deletion_protection_enabled = ?1 WHERE table_name = ?2".to_string(),
+                vec![SqlParam::Integer(0), SqlParam::text("T")],
+            )
         );
     }
 }
