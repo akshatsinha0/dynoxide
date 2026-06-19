@@ -345,6 +345,45 @@ export async function exec_batch(handle, sql, paramRows) {
 }
 
 /**
+ * Run several distinct statements in order in a single bridge crossing. Unlike
+ * `exec_batch` (one statement reused over many parameter rows), each entry
+ * carries its own `sql` and positional `params`, so a statement is prepared,
+ * stepped to completion, and finalised before the next runs. This is the shape
+ * the per-write and per-delete index fan-out needs: a delete and an insert per
+ * GSI/LSI - several different statements, one binding each - collapsed from one
+ * crossing per operation into one crossing for the whole list.
+ *
+ * It owns no transaction - it runs inside whatever the caller has open - so a
+ * mid-script failure is rolled back by the caller's transaction, not here. Any
+ * failure (prepare, bind, or step) throws an Error naming the failing statement
+ * index, so a mid-script failure is diagnosable. An empty list makes no work.
+ *
+ * Each statement's `params` bind its placeholders in order. The builders that
+ * produce these pairs always match arity, so there is no per-statement arity
+ * guard like `exec_batch`'s: a too-long array throws at `bind` (the only
+ * mismatch the builders cannot produce), and that throw is reported with its
+ * statement index like any other.
+ */
+export async function exec_script(handle, statements) {
+  if (!statements || !statements.length) return;
+  for (let i = 0; i < statements.length; i += 1) {
+    const { sql, params } = statements[i];
+    let stmt;
+    try {
+      stmt = handle.db.prepare(sql);
+      if (params && params.length) stmt.bind(params);
+      while (stmt.step()) {
+        // a row-less write; drain any result rows without collecting them
+      }
+    } catch (e) {
+      throw new Error(`exec_script statement ${i}: ${e.message}`);
+    } finally {
+      if (stmt) stmt.finalize();
+    }
+  }
+}
+
+/**
  * Close a database handle, releasing its connection so a re-open does not leak
  * the old one. When the last connection on a persistent pool closes, the pool
  * is paused: its OPFS sync access handles are relinquished (so another tab can
