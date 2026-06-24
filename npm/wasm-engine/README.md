@@ -10,7 +10,7 @@ It's a preview. The wasm build is not run against the conformance suite that bac
 npm install @dynoxide/wasm-engine@preview
 ```
 
-The `@preview` is required. This is a preview build, published only under the `preview` dist-tag, so a bare `npm install @dynoxide/wasm-engine` resolves `latest`, which is intentionally unset, and a `^0.11.0-preview` range won't track it either. Pin the exact version or use the `@preview` tag.
+`npm install @dynoxide/wasm-engine@preview` pulls the preview build; you can also pin the exact version (`0.11.0-preview`). It's a preview, so its version carries `-preview` and the wasm path is not run against the conformance suite.
 
 ## Quick start
 
