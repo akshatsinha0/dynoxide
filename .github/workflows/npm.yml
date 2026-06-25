@@ -189,19 +189,20 @@ jobs:
             exit 1
           fi
 
-      # Publish to `latest` (the default tag). The `-preview` version is the only
-      # preview marker; npm OIDC publishing can only set the tag it publishes to,
-      # so we do not maintain a separate `preview` dist-tag that would drift from
-      # `latest`. A normal `npm install @dynoxide/wasm-engine` therefore gets the
-      # current preview. When the wasm path graduates (conformance-tested), drop
-      # the `-preview` suffix in "Determine version" and `latest` lands on the
-      # stable release with no tag juggling.
+      # Publish to `latest`. The `-preview` version string is the only preview
+      # marker; OIDC publishing can only set the tag it publishes to, so we do not
+      # maintain a separate `preview` dist-tag that would drift from `latest`, and
+      # a normal `npm install @dynoxide/wasm-engine` gets the current preview. The
+      # tag is passed explicitly because npm refuses a bare publish of a prerelease
+      # version ("You must specify a tag using --tag"); it does not default one.
+      # When the wasm path graduates (conformance-tested), drop the `-preview`
+      # suffix in "Determine version" and this still lands on `latest`.
       - name: Publish (dry-run)
         if: steps.published.outputs.skip == 'false'
         working-directory: npm/wasm-engine
-        run: npm publish --dry-run --access public --provenance
+        run: npm publish --dry-run --access public --provenance --tag latest
 
       - name: Publish to npm
         if: steps.published.outputs.skip == 'false'
         working-directory: npm/wasm-engine
-        run: npm publish --access public --provenance
+        run: npm publish --access public --provenance --tag latest
