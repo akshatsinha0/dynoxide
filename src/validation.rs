@@ -309,8 +309,14 @@ pub fn partition_key_name(key_schema: &[KeySchemaElement]) -> Option<&str> {
         .map(|k| k.attribute_name.as_str())
 }
 
-/// Maximum nesting depth for item attribute values (DynamoDB's limit).
+/// DynamoDB caps document nesting at 32 levels, counting the top-level attribute
+/// value as level 1. Values are validated 0-indexed (top-level = depth 0), so the
+/// deepest permitted leaf sits at depth 31 and a value reaching depth 32 is rejected.
 const MAX_NESTING_DEPTH: usize = 32;
+
+/// Real DynamoDB's verbatim message when document nesting exceeds the limit. Shared
+/// by the stored-item and ExpressionAttributeValue checks so both match AWS.
+const NESTING_LIMIT_MESSAGE: &str = "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit";
 
 /// Validate all attribute values in an item.
 ///
@@ -335,9 +341,9 @@ pub fn validate_item_attribute_values(item: &Item) -> Result<()> {
 }
 
 fn validate_attribute_value(value: &AttributeValue, depth: usize) -> Result<()> {
-    if depth > MAX_NESTING_DEPTH {
+    if depth >= MAX_NESTING_DEPTH {
         return Err(DynoxideError::ValidationException(
-            "Nesting level exceeds limit of 32".to_string(),
+            NESTING_LIMIT_MESSAGE.to_string(),
         ));
     }
     match value {
@@ -415,6 +421,35 @@ fn validate_attribute_value(value: &AttributeValue, depth: usize) -> Result<()> 
             }
             Ok(())
         }
+        _ => Ok(()),
+    }
+}
+
+/// Validate that a single `ExpressionAttributeValue` does not nest deeper than
+/// DynamoDB allows.
+///
+/// Real DynamoDB rejects expression values whose document nesting exceeds 32 levels
+/// up front, before the expression is evaluated, raising the same bare nesting
+/// `ValidationException` it raises for over-deep stored items (no "ExpressionAttributeValues
+/// contains invalid value" wrapper). Only the nesting depth is checked here; empty
+/// strings and other shapes that are legal in comparisons are left untouched.
+pub fn validate_nesting_depth(value: &AttributeValue) -> Result<()> {
+    check_nesting_depth(value, 0)
+}
+
+fn check_nesting_depth(value: &AttributeValue, depth: usize) -> Result<()> {
+    if depth >= MAX_NESTING_DEPTH {
+        return Err(DynoxideError::ValidationException(
+            NESTING_LIMIT_MESSAGE.to_string(),
+        ));
+    }
+    match value {
+        AttributeValue::L(list) => list
+            .iter()
+            .try_for_each(|v| check_nesting_depth(v, depth + 1)),
+        AttributeValue::M(map) => map
+            .values()
+            .try_for_each(|v| check_nesting_depth(v, depth + 1)),
         _ => Ok(()),
     }
 }

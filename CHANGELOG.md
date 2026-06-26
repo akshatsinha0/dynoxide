@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A `ConditionExpression` comparing a Map (`M`) or List (`L`) attribute for equality now works, where `=` always reported not-equal and `<>` always equal regardless of the values. `compare_values` had no arm for document types, so every map or list comparison fell through to the not-equal default; it now compares them deeply - maps order-independently, lists element-wise in order - with nested numbers normalised as elsewhere. The same path backs `IN`, `BETWEEN`, and `contains` over document operands, so those are fixed too ([#103](https://github.com/nubo-db/dynoxide/issues/103)).
+- `ExpressionAttributeValues` nested beyond DynamoDB's 32-level document limit are now rejected up front with the same `ValidationException` AWS returns, where before they were accepted and evaluated. The check runs on every path that takes expression values - PutItem, UpdateItem, DeleteItem, Query, Scan, and TransactWriteItems. The stored-item nesting check was also one level too lenient (it accepted a value AWS rejects) and carried a non-AWS message; both now match DynamoDB's limit and wording, confirmed against real AWS in eu-west-2 ([#110](https://github.com/nubo-db/dynoxide/issues/110)).
+- Number-set equality in a condition or filter expression now compares at full precision, where it parsed each member to `f64` and so reported two sets differing only beyond ~15 significant digits as equal. It now uses the canonical numeric form, matching DynamoDB and the way number-set duplicates are already detected on write; the fix also covers number sets nested inside a map or list ([#111](https://github.com/nubo-db/dynoxide/issues/111)).
+
 ## [0.11.0] - 2026-06-24
 
 ### Added

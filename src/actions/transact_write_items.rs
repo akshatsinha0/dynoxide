@@ -273,6 +273,18 @@ async fn execute_single_action<S: StorageBackend>(
     }
 }
 
+/// Reject any ExpressionAttributeValue that nests deeper than DynamoDB allows.
+/// TransactWriteItems does not route through the shared expression-param helper, so
+/// the per-value nesting check is applied here for each sub-action's values.
+fn validate_eav_nesting(values: &Option<HashMap<String, AttributeValue>>) -> Result<()> {
+    if let Some(map) = values {
+        for value in map.values() {
+            crate::validation::validate_nesting_depth(value)?;
+        }
+    }
+    Ok(())
+}
+
 async fn execute_put<S: StorageBackend>(storage: &S, put: &TransactPut) -> Result<()> {
     crate::validation::validate_table_name(&put.table_name)?;
     let meta = helpers::require_table_for_item_op(storage, &put.table_name).await?;
@@ -294,6 +306,8 @@ async fn execute_put<S: StorageBackend>(storage: &S, put: &TransactPut) -> Resul
 
     // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&item, &key_schema)?;
+
+    validate_eav_nesting(&put.expression_attribute_values)?;
 
     let tracker = crate::expressions::TrackedExpressionAttributes::new(
         &put.expression_attribute_names,
@@ -383,6 +397,8 @@ async fn execute_update<S: StorageBackend>(storage: &S, update: &TransactUpdate)
         .as_ref()
         .and_then(|j| serde_json::from_str(j).ok())
         .unwrap_or_default();
+
+    validate_eav_nesting(&update.expression_attribute_values)?;
 
     let tracker = crate::expressions::TrackedExpressionAttributes::new(
         &update.expression_attribute_names,
@@ -500,6 +516,8 @@ async fn execute_delete<S: StorageBackend>(storage: &S, delete: &TransactDelete)
     // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&delete.key, &key_schema)?;
 
+    validate_eav_nesting(&delete.expression_attribute_values)?;
+
     let tracker = crate::expressions::TrackedExpressionAttributes::new(
         &delete.expression_attribute_names,
         &delete.expression_attribute_values,
@@ -564,6 +582,8 @@ async fn execute_condition_check<S: StorageBackend>(
         .as_ref()
         .and_then(|j| serde_json::from_str(j).ok())
         .unwrap_or_default();
+
+    validate_eav_nesting(&check.expression_attribute_values)?;
 
     let tracker = crate::expressions::TrackedExpressionAttributes::new(
         &check.expression_attribute_names,
