@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-06-26
+
 ### Fixed
 
 - A `ConditionExpression` comparing a Map (`M`) or List (`L`) attribute for equality now works, where `=` always reported not-equal and `<>` always equal regardless of the values. `compare_values` had no arm for document types, so every map or list comparison fell through to the not-equal default; it now compares them deeply - maps order-independently, lists element-wise in order - with nested numbers normalised as elsewhere. The same path backs `IN`, `BETWEEN`, and `contains` over document operands, so those are fixed too ([#103](https://github.com/nubo-db/dynoxide/issues/103)).
@@ -368,7 +370,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/nubo-db/dynoxide/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/nubo-db/dynoxide/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/nubo-db/dynoxide/compare/v0.9.13...v0.10.0
 [0.9.13]: https://github.com/nubo-db/dynoxide/compare/v0.9.12...v0.9.13
