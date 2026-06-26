@@ -10,7 +10,7 @@ It's a preview. The wasm build is not run against the conformance suite that bac
 npm install @dynoxide/wasm-engine
 ```
 
-This is a preview build: the version carries `-preview` and the wasm path is not run against the conformance suite. `npm install @dynoxide/wasm-engine` gets the current preview; pin the exact version (`0.11.0-preview.1`) to lock to one.
+This is a preview build: the version carries `-preview` and the wasm path is not run against the conformance suite. `npm install @dynoxide/wasm-engine` gets the current preview; pin the exact version (`0.11.1-preview`) to lock to one.
 
 ## Quick start
 
@@ -84,7 +84,7 @@ The engine needs a [secure context](https://developer.mozilla.org/en-US/docs/Web
 
 ## Versioning
 
-`CONTRACT_VERSION` stamps the message-envelope shape, not the engine version. Adding an operation leaves it alone; changing a request, response, or error envelope bumps it. The client validates it against the engine on boot and fails loudly on a mismatch, so a pinned consumer fails with a clear error rather than mis-reading a newer engine. The shipped engine and contract versions sit in `manifest.json`. `manifest.engineVersion` is the dynoxide crate version (e.g. `0.11.0`); the npm package version layers a `-preview` suffix on top (e.g. `0.11.0-preview.1`), since the package is a preview distribution of that crate version.
+`CONTRACT_VERSION` stamps the message-envelope shape, not the engine version. Adding an operation leaves it alone; changing a request, response, or error envelope bumps it. The client validates it against the engine on boot and fails loudly on a mismatch, so a pinned consumer fails with a clear error rather than mis-reading a newer engine. The shipped engine and contract versions sit in `manifest.json`. `manifest.engineVersion` is the dynoxide crate version (e.g. `0.11.1`); the npm package version layers a `-preview` suffix on top (e.g. `0.11.1-preview`), since the package is a preview distribution of that crate version.
 
 ## Persistence
 
