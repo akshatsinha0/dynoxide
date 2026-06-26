@@ -741,6 +741,9 @@ pub fn validate_expression_params(
 
 /// Validate a single ExpressionAttributeValues entry.
 fn validate_expression_attribute_value(key: &str, value: &AttributeValue) -> Result<()> {
+    // Over-deep expression values are rejected up front, before evaluation, with the
+    // bare nesting message real DynamoDB uses (no "contains invalid value" wrapper).
+    crate::validation::validate_nesting_depth(value)?;
     // Check for empty/unsupported datatypes
     match value {
         AttributeValue::NULL(b) if !b => {
