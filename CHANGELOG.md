@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A `CreateTable` global or local secondary index using `ProjectionType: INCLUDE` without a `NonKeyAttributes` list is now rejected with the `ValidationException` real DynamoDB returns (`One or more parameter values were invalid: ProjectionType is INCLUDE, but NonKeyAttributes is not specified`), where dynoxide accepted it and created the table. `INCLUDE` projects the index key attributes plus an explicit list, so the list is mandatory; the shared projection validator now requires it, closing the gap for both index types ([#116](https://github.com/nubo-db/dynoxide/issues/116)).
+
 ## [0.11.1] - 2026-06-26
 
 ### Fixed
