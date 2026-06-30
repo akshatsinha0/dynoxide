@@ -540,19 +540,39 @@ impl Database<RusqliteBackend> {
 
         // Check idempotency cache
         if let Some(ref token) = request.client_request_token {
-            let mut cache = self
-                .idempotency_tokens
-                .lock()
-                .map_err(|e| DynoxideError::InternalServerError(format!("Lock poisoned: {e}")))?;
-            // Evict expired entries
-            cache.retain(|_, (ts, _, _)| ts.elapsed().as_secs() < TOKEN_EXPIRY_SECS);
-            if let Some((_, cached_hash, resp)) = cache.get(token) {
-                if *cached_hash != request_hash {
-                    return Err(DynoxideError::IdempotentParameterMismatchException(
-                        "An error occurred (IdempotentParameterMismatchException)".to_string(),
-                    ));
+            // Resolve the cache hit while holding the lock and clone what the
+            // replay needs, then release the lock before re-deriving capacity so
+            // a same-token retry storm does not serialise on the global mutex.
+            // `Some(metrics)` is a hit; the inner value is the cached first-call
+            // item-collection metrics.
+            let cached_metrics = {
+                let mut cache = self.idempotency_tokens.lock().map_err(|e| {
+                    DynoxideError::InternalServerError(format!("Lock poisoned: {e}"))
+                })?;
+                // Evict expired entries
+                cache.retain(|_, (ts, _, _)| ts.elapsed().as_secs() < TOKEN_EXPIRY_SECS);
+                match cache.get(token) {
+                    Some((_, cached_hash, resp)) => {
+                        if *cached_hash != request_hash {
+                            return Err(DynoxideError::IdempotentParameterMismatchException(
+                                "An error occurred (IdempotentParameterMismatchException)"
+                                    .to_string(),
+                            ));
+                        }
+                        Some(resp.item_collection_metrics.clone())
+                    }
+                    None => None,
                 }
-                return Ok(resp.clone());
+            };
+            // A same-token in-window replay re-reads the stored result, so it
+            // reports READ capacity at the same magnitude as the first call's
+            // write, honouring this replay's own ReturnConsumedCapacity mode.
+            if let Some(cached_metrics) = cached_metrics {
+                return Ok(actions::transact_write_items::replay_response(
+                    &request.transact_items,
+                    &request.return_consumed_capacity,
+                    cached_metrics,
+                ));
             }
         }
 
