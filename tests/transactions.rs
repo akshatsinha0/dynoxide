@@ -1039,6 +1039,7 @@ fn test_transact_condition_check_costs_two_write_units() {
         .expect("per-table entry for the check table");
     assert_eq!(check.capacity_units, 2.0);
     assert_eq!(check.write_capacity_units, Some(2.0));
+    assert_eq!(check.read_capacity_units, None);
 }
 
 /// A same-token idempotent replay re-reads the stored result: the first call
@@ -1072,6 +1073,121 @@ fn test_transact_write_replay_reports_read_capacity() {
     assert_eq!(replay_entry.capacity_units, 2.0);
     assert_eq!(replay_entry.read_capacity_units, Some(2.0));
     assert_eq!(replay_entry.write_capacity_units, None);
+}
+
+/// A same-token replay honours the replay request's own ReturnConsumedCapacity
+/// mode, not the first call's. First call INDEXES, replay TOTAL: the replay
+/// reports read capacity in TOTAL shape (no Table breakdown).
+#[test]
+fn test_transact_write_replay_honours_replay_mode() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Txn");
+
+    let items = json!([
+        {"Put": {"TableName": "Txn", "Item": {"pk": {"S": "a"}, "v": {"N": "1"}}}}
+    ]);
+    let first = json!({
+        "ClientRequestToken": "replay-mode-token",
+        "ReturnConsumedCapacity": "INDEXES",
+        "TransactItems": items.clone()
+    });
+    db.transact_write_items(serde_json::from_value(first).unwrap())
+        .unwrap();
+
+    let replay = json!({
+        "ClientRequestToken": "replay-mode-token",
+        "ReturnConsumedCapacity": "TOTAL",
+        "TransactItems": items
+    });
+    let resp = db
+        .transact_write_items(serde_json::from_value(replay).unwrap())
+        .unwrap();
+    let entry = &resp.consumed_capacity.unwrap()[0];
+    assert_eq!(entry.capacity_units, 2.0);
+    assert_eq!(entry.read_capacity_units, Some(2.0));
+    assert_eq!(entry.write_capacity_units, None);
+    assert!(
+        entry.table.is_none(),
+        "TOTAL mode carries no Table breakdown"
+    );
+}
+
+/// A same-token replay with no ReturnConsumedCapacity reports no capacity at
+/// all, even though the first call requested INDEXES (the replay honours its
+/// own mode).
+#[test]
+fn test_transact_write_replay_without_capacity_mode_returns_none() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Txn");
+
+    let items = json!([
+        {"Put": {"TableName": "Txn", "Item": {"pk": {"S": "a"}, "v": {"N": "1"}}}}
+    ]);
+    let first = json!({
+        "ClientRequestToken": "replay-none-token",
+        "ReturnConsumedCapacity": "INDEXES",
+        "TransactItems": items.clone()
+    });
+    db.transact_write_items(serde_json::from_value(first).unwrap())
+        .unwrap();
+
+    let replay = json!({
+        "ClientRequestToken": "replay-none-token",
+        "TransactItems": items
+    });
+    let resp = db
+        .transact_write_items(serde_json::from_value(replay).unwrap())
+        .unwrap();
+    assert!(resp.consumed_capacity.is_none());
+}
+
+/// Under TOTAL mode a transactional write reports top-level WriteCapacityUnits
+/// (and no ReadCapacityUnits, no Table breakdown).
+#[test]
+fn test_transact_write_total_mode_reports_top_level_write_capacity() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Txn");
+
+    let req = json!({
+        "ReturnConsumedCapacity": "TOTAL",
+        "TransactItems": [
+            {"Put": {"TableName": "Txn", "Item": {"pk": {"S": "a"}, "v": {"N": "1"}}}}
+        ]
+    });
+    let resp = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap();
+    let entry = &resp.consumed_capacity.unwrap()[0];
+    assert_eq!(entry.capacity_units, 2.0);
+    assert_eq!(entry.write_capacity_units, Some(2.0));
+    assert_eq!(entry.read_capacity_units, None);
+    assert!(
+        entry.table.is_none(),
+        "TOTAL mode carries no Table breakdown"
+    );
+}
+
+/// Under TOTAL mode a transactional read reports top-level ReadCapacityUnits
+/// (and no WriteCapacityUnits).
+#[test]
+fn test_transact_get_total_mode_reports_top_level_read_capacity() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Txn");
+    put_item(&db, "Txn", "present", "x");
+
+    let req = json!({
+        "ReturnConsumedCapacity": "TOTAL",
+        "TransactItems": [
+            {"Get": {"TableName": "Txn", "Key": {"pk": {"S": "present"}}}}
+        ]
+    });
+    let resp = db
+        .transact_get_items(serde_json::from_value(req).unwrap())
+        .unwrap();
+    let entry = &resp.consumed_capacity.unwrap()[0];
+    assert_eq!(entry.capacity_units, 2.0);
+    assert_eq!(entry.read_capacity_units, Some(2.0));
+    assert_eq!(entry.write_capacity_units, None);
 }
 
 // ---- empty-string key values surface top-level; type-mismatch / non-scalar stay cancellation reasons ----
