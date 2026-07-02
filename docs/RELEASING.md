@@ -69,8 +69,8 @@ Public workflows a contributor may see when opening a PR:
 
 Additional workflows in `.github/workflows/` (`benchmark-refresh.yml`,
 `release-preflight.yml`, `test-build.yml`, `publish-crate.yml`,
-`homebrew.yml`, `npm.yml`, `docker.yml`) support release operations and
-recovery. They are maintainer workflows and are not exercised by PR
+`homebrew.yml`, `npm.yml`, `docker.yml`, `mcp.yml`) support release operations
+and recovery. They are maintainer workflows and are not exercised by PR
 traffic.
 
 ## Maintainer runbook
