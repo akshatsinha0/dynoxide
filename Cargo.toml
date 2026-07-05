@@ -34,7 +34,7 @@ encryption-cc = ["_has-encryption", "rusqlite/bundled-sqlcipher"]
 encrypted-server = ["encryption", "http-server"]
 encrypted-server-cc = ["encryption-cc", "http-server"]
 encrypted-full = ["encryption", "http-server", "mcp-server", "import"]
-mcp-server = ["cli", "dep:rmcp", "dep:schemars", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:tracing", "dep:tracing-subscriber", "dep:libc", "dep:directories", "dep:subtle"]
+mcp-server = ["cli", "dep:rmcp", "dep:schemars", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:tracing", "dep:tracing-subscriber", "dep:libc", "dep:directories", "dep:subtle", "dep:socket2", "dep:windows-sys"]
 import = ["cli", "dep:toml", "dep:fake", "dep:sha2", "dep:flate2", "dep:indicatif", "dep:zstd", "dep:tempfile"]
 
 # Real wasm SQLite backend. dynoxide compiles to wasm32-unknown-unknown and

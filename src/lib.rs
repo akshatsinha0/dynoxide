@@ -49,6 +49,8 @@ pub mod import;
 pub mod macros;
 #[cfg(feature = "mcp-server")]
 pub mod mcp;
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+pub(crate) mod net;
 pub mod partiql;
 pub mod schema;
 #[cfg(feature = "http-server")]

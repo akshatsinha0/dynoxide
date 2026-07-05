@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- On Windows, the HTTP listener now binds with `SO_EXCLUSIVEADDRUSE`, closing a hole where another process running as the same user could take over the port with `SO_REUSEADDR` while dynoxide was serving. Restarting immediately after a clean shutdown still works; a regression test covers the rebind, and CI now runs the unit tests on Windows ([#23](https://github.com/nubo-db/dynoxide/issues/23)).
+- On Windows, the HTTP and MCP listeners now bind with `SO_EXCLUSIVEADDRUSE`, closing a hole where another process running as the same user could take over either port with `SO_REUSEADDR` while dynoxide was serving. Restarting immediately after a clean shutdown still works; a regression test covers the rebind, and CI now runs the unit tests on Windows ([#23](https://github.com/nubo-db/dynoxide/issues/23)).
 
 ## [0.11.2] - 2026-07-02
 
