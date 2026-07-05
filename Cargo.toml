@@ -26,7 +26,7 @@ default = ["native-sqlite", "http-server", "mcp-server", "import"]
 # keys off `cli` so the binary is skipped in backend-neutral builds such as
 # `--no-default-features --features wasm-sqlite`, which ship the library only.
 cli = ["dep:clap"]
-http-server = ["cli", "dep:axum", "dep:tokio", "dep:tower-http", "dep:tracing", "dep:tracing-subscriber", "dep:socket2", "dep:crc32fast"]
+http-server = ["cli", "dep:axum", "dep:tokio", "dep:tower-http", "dep:tracing", "dep:tracing-subscriber", "dep:socket2", "dep:crc32fast", "dep:windows-sys"]
 native-sqlite = ["dep:rusqlite", "rusqlite/bundled"]
 _has-encryption = ["dep:zeroize"]
 encryption = ["_has-encryption", "rusqlite/bundled-sqlcipher-vendored-openssl"]
@@ -117,6 +117,11 @@ async-lock = { version = "3", optional = true }
 # and keep the default getrandom-backed RNG.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { version = "1", features = ["js"] }
+
+# The HTTP server sets SO_EXCLUSIVEADDRUSE on its listener, which socket2
+# does not expose, so it needs raw setsockopt access.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

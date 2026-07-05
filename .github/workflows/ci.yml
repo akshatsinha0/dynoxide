@@ -36,6 +36,21 @@ jobs:
       - name: Test
         run: cargo test ${{ matrix.flags }}
 
+  # The listener bind path is platform-specific (SO_REUSEADDR on Unix,
+  # SO_EXCLUSIVEADDRUSE on Windows), so the unit tests need a Windows run;
+  # test-build.yml only builds there.
+  test-windows:
+    name: Test (windows)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --lib
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
