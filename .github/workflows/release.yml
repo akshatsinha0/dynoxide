@@ -380,8 +380,8 @@ jobs:
 
       # QEMU is for the post-push verification step that runs the arm64
       # image on the amd64 runner. The build itself is pure COPY.
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
 
       - name: Login to GHCR
         id: ghcr-login
@@ -417,7 +417,7 @@ jobs:
 
       - name: Compute image tags and labels
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
           flavor: |
@@ -429,7 +429,7 @@ jobs:
 
       - name: Build and push to GHCR
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
