@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # --- crates.io -----------------------------------------------------
       - uses: dtolnay/rust-toolchain@stable
@@ -33,7 +33,7 @@ jobs:
         run: cargo publish --dry-run
 
       # --- npm OIDC ------------------------------------------------------
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: "24"
 
@@ -78,7 +78,7 @@ jobs:
       - name: GHCR auth probe
         id: ghcr-check
         continue-on-error: true
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -88,7 +88,7 @@ jobs:
       - name: Docker Hub auth probe
         id: dockerhub-check
         continue-on-error: true
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -97,7 +97,7 @@ jobs:
       - name: ECR Public AWS credentials probe
         id: ecr-public-creds
         continue-on-error: true
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.ECR_PUBLIC_PUBLISH_ROLE_ARN }}
           aws-region: us-east-1
