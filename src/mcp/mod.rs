@@ -136,7 +136,11 @@ pub async fn serve_http_with_shutdown(
         axum::middleware::from_fn_with_state(opts.auth.clone(), auth::enforce),
     );
     let addr = format_bind_addr(&opts.host, opts.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // The shared exclusive-bind path gives this port the same Windows
+    // hijack protection as the DynamoDB listener. Unix behaviour is
+    // unchanged: tokio's bind also set SO_REUSEADDR there.
+    let std_listener = crate::net::bind_exclusive_to(&addr).map_err(std::io::Error::other)?;
+    let listener = tokio::net::TcpListener::from_std(std_listener)?;
     let local_addr = listener.local_addr()?;
 
     eprintln!("MCP HTTP server listening on http://{local_addr}/mcp");

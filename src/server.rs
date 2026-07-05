@@ -3,6 +3,7 @@
 //! Only compiled with the `http-server` feature flag.
 
 use crate::Database;
+use crate::net::bind_exclusive;
 use axum::{
     Router,
     body::Body,
@@ -50,42 +51,6 @@ fn check_port_available(addr: SocketAddr) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// Bind a TCP listener.
-///
-/// `SO_REUSEADDR` on Unix lets us rebind past `TIME_WAIT` sockets from a
-/// previous clean shutdown. It doesn't let two live listeners share a port
-/// (that's `SO_REUSEPORT`), so port-conflict detection still works. Not set
-/// on Windows: the semantics there allow hijacking an active bind.
-fn bind_exclusive(addr: SocketAddr) -> Result<std::net::TcpListener, String> {
-    use socket2::{Domain, Protocol, Socket, Type};
-
-    let domain = if addr.is_ipv6() {
-        Domain::IPV6
-    } else {
-        Domain::IPV4
-    };
-
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-        .map_err(|e| format!("failed to create socket: {e}"))?;
-
-    #[cfg(unix)]
-    socket
-        .set_reuse_address(true)
-        .map_err(|e| format!("failed to set SO_REUSEADDR: {e}"))?;
-
-    socket
-        .set_nonblocking(true)
-        .map_err(|e| format!("failed to set nonblocking: {e}"))?;
-    socket
-        .bind(&addr.into())
-        .map_err(|e| format!("failed to bind {addr}: {e}"))?;
-    socket
-        .listen(1024)
-        .map_err(|e| format!("failed to listen on {addr}: {e}"))?;
-
-    Ok(std::net::TcpListener::from(socket))
 }
 
 /// Start the HTTP server.
