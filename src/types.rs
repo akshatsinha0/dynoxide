@@ -357,7 +357,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
 /// Returns DynamoDB-matching error messages for invalid numbers.
 /// Error messages are returned WITHOUT the VALIDATION: prefix since they
 /// bypass the normal validation flow — the server routes them based on
-/// message content (see `server::deserialize`).
+/// message content (see `server::serde_errors::deserialize`).
 fn validate_number_in_deser(n: &str) -> Result<(), String> {
     // validate_dynamo_number is the single source of truth for number format
     // and precision/range; the deser path only reshapes the error message.
